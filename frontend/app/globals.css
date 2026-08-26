@@ -1,0 +1,105 @@
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground-rgb: 255, 255, 255;
+  --background-start-rgb: 15, 23, 42;
+  --background-end-rgb: 2, 6, 23;
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background: linear-gradient(
+      to bottom,
+      transparent,
+      rgb(var(--background-end-rgb))
+    )
+    rgb(var(--background-start-rgb));
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1e293b;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Pixel art rendering */
+.pixel-art {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+/* Game container */
+.game-container {
+  box-shadow: 0 0 40px rgba(74, 222, 128, 0.3);
+}
+
+/* Button styles */
+.btn-game {
+  @apply px-6 py-3 bg-game-primary text-game-darker font-pixel text-sm rounded-lg
+         hover:bg-game-secondary transition-all duration-200
+         shadow-lg hover:shadow-game-primary/50
+         active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed;
+}
+
+.btn-secondary {
+  @apply px-4 py-2 bg-game-border text-white font-pixel text-xs rounded-lg
+         hover:bg-slate-600 transition-all duration-200
+         active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed;
+}
+
+/* Panel styles */
+.panel {
+  @apply bg-game-dark/90 backdrop-blur-sm border border-game-border rounded-lg p-4;
+}
+
+/* Glow effect */
+.glow {
+  box-shadow: 0 0 20px rgba(74, 222, 128, 0.4);
+}
+
+/* Inventory slot */
+.inventory-slot {
+  @apply w-12 h-12 bg-game-darker border border-game-border rounded
+         flex items-center justify-center cursor-pointer
+         hover:border-game-primary hover:bg-game-dark transition-all;
+}
+
+.inventory-slot.selected {
+  @apply border-game-accent bg-game-dark;
+}
+
+/* Chat styles */
+.chat-message {
+  @apply py-1 px-2 text-sm;
+}
+
+.chat-message.system {
+  @apply text-game-accent italic;
+}
+
+.chat-message.player {
+  @apply text-white;
+}
+
+.chat-message .username {
+  @apply text-game-primary font-bold mr-2;
+}
