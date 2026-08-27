@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Secrets — never commit a private key or an API key.
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Hardhat
+artifacts/
+cache/
+typechain/
+typechain-types/
+coverage/
+coverage.json
+.coverage_contracts/
+
+# Deployment manifests are intentionally COMMITTED: they are public addresses,
+# and the frontend build reads them. Only the local dev chain is ignored, since
+# its addresses are meaningless outside one machine.
+deployments/31337.json
+
+# Next.js
+.next/
+out/
+next-env.d.ts
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Generated frontend bindings (regenerate with: npm run export:abi)
+frontend/lib/generated/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/

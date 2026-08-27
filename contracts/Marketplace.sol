@@ -1,55 +1,71 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
-import "./FarmToken.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
  * @title Marketplace
- * @dev NFT marketplace for trading game items using FGOLD tokens
- * Supports listing, buying, and canceling NFT sales
+ * @notice Escrowed peer-to-peer NFT trading settled in FGOLD.
+ *
+ * @dev Front-running
+ * ---------------
+ * {buyItem} takes a `maxPrice`. Without it a seller could watch the mempool
+ * and raise the price via {updateListingPrice} so the buyer's already-signed
+ * transaction pays more than they agreed to. That was live in the previous
+ * version. Two defences are in place now:
+ *
+ *   1. The buyer states the most they will pay; the trade reverts otherwise.
+ *   2. A price increase resets `priceValidFrom`, and {buyItem} rejects
+ *      listings repriced in the current block, closing the same-block
+ *      reprice-then-fill window.
+ *
+ * @dev Escrow safety
+ * ----------------
+ * {rescueNFT} can no longer touch a token backing an active listing. It
+ * previously cancelled the listing and sent the NFT anywhere the owner chose,
+ * which let the operator seize any escrowed item. Recovery of genuinely stuck
+ * tokens (sent here by mistake, never listed) still works.
  */
-contract Marketplace is Ownable, ReentrancyGuard, ERC721Holder {
-    // The FGOLD token used for payments
-    FarmToken public farmToken;
+contract Marketplace is Ownable2Step, ReentrancyGuard, Pausable, ERC721Holder {
+    using SafeERC20 for IERC20;
 
-    // Listing struct
     struct Listing {
-        address seller;         // Address of the seller
-        address nftContract;    // Address of the NFT contract
-        uint256 tokenId;        // Token ID of the NFT
-        uint256 price;          // Price in FGOLD tokens
-        uint256 listedAt;       // Timestamp when listed
-        bool isActive;          // Whether the listing is active
+        address seller;
+        address nftContract;
+        uint256 tokenId;
+        uint256 price;
+        uint256 listedAt;
+        uint256 priceValidFrom; // block after which the current price may be filled
+        bool isActive;
     }
 
-    // Mapping from listing ID to Listing data
+    IERC20 public immutable farmToken;
+
     mapping(uint256 => Listing) public listings;
+    uint256 public listingIdCounter; // ids start at 1; 0 means "not listed"
 
-    // Listing ID counter
-    uint256 public listingIdCounter;
-
-    // Mapping from NFT contract => token ID => listing ID
     mapping(address => mapping(uint256 => uint256)) public nftToListingId;
+    mapping(address => uint256[]) private _sellerListings;
 
-    // Mapping from seller address to their listing IDs
-    mapping(address => uint256[]) public sellerListings;
+    /// @dev Dense array of active listing ids, with an index side-table for
+    ///      O(1) removal. Enumeration used to rescan every id ever created,
+    ///      which turns into an RPC timeout long before it turns into a bug.
+    uint256[] private _activeListingIds;
+    mapping(uint256 => uint256) private _activeListingIndex; // listingId => index+1
 
-    // Marketplace fee (in basis points, e.g., 250 = 2.5%)
-    uint256 public marketplaceFee;
-    uint256 public constant MAX_FEE = 1000; // 10% max fee
+    uint256 public marketplaceFee; // basis points
+    uint256 public constant MAX_FEE = 1000; // 10%
     uint256 public constant FEE_DENOMINATOR = 10000;
 
-    // Accumulated fees
     uint256 public accumulatedFees;
-
-    // Whitelisted NFT contracts that can be traded
     mapping(address => bool) public whitelistedNFTs;
 
-    // Events
     event ItemListed(
         uint256 indexed listingId,
         address indexed seller,
@@ -66,372 +82,303 @@ contract Marketplace is Ownable, ReentrancyGuard, ERC721Holder {
         uint256 price,
         uint256 fee
     );
-    event ListingCanceled(
-        uint256 indexed listingId,
-        address indexed seller,
-        address nftContract,
-        uint256 tokenId
-    );
-    event ListingPriceUpdated(
-        uint256 indexed listingId,
-        uint256 oldPrice,
-        uint256 newPrice
-    );
+    event ListingCanceled(uint256 indexed listingId, address indexed seller, address nftContract, uint256 tokenId);
+    event ListingPriceUpdated(uint256 indexed listingId, uint256 oldPrice, uint256 newPrice);
     event NFTWhitelisted(address indexed nftContract, bool status);
     event MarketplaceFeeUpdated(uint256 oldFee, uint256 newFee);
     event FeesWithdrawn(address indexed recipient, uint256 amount);
+    event NFTRescued(address indexed nftContract, uint256 tokenId, address indexed recipient);
 
-    /**
-     * @dev Constructor initializes the marketplace
-     * @param initialOwner The address that will own the contract
-     * @param _farmToken Address of the FarmToken contract
-     * @param _marketplaceFee Initial marketplace fee in basis points
-     */
+    error ZeroAddress();
+    error FeeTooHigh(uint256 requested, uint256 maximum);
+    error NotWhitelisted(address nftContract);
+    error PriceMustBePositive();
+    error NotTokenOwner(uint256 tokenId, address caller);
+    error NotApproved(address nftContract, uint256 tokenId);
+    error AlreadyListed(address nftContract, uint256 tokenId);
+    error ListingNotActive(uint256 listingId);
+    error CannotBuyOwnItem(uint256 listingId);
+    error PriceExceedsMaximum(uint256 price, uint256 maxPrice);
+    error PriceJustChanged(uint256 listingId);
+    error NotSeller(uint256 listingId, address caller);
+    error NoFeesToWithdraw();
+    error TokenIsListed(address nftContract, uint256 tokenId);
+
     constructor(
         address initialOwner,
         address _farmToken,
         uint256 _marketplaceFee
     ) Ownable(initialOwner) {
-        require(_farmToken != address(0), "Marketplace: invalid token address");
-        require(_marketplaceFee <= MAX_FEE, "Marketplace: fee too high");
-
-        farmToken = FarmToken(_farmToken);
+        if (initialOwner == address(0) || _farmToken == address(0)) revert ZeroAddress();
+        if (_marketplaceFee > MAX_FEE) revert FeeTooHigh(_marketplaceFee, MAX_FEE);
+        // Immutable: swapping the settlement token under live listings would
+        // let sellers be paid in something they never agreed to accept.
+        farmToken = IERC20(_farmToken);
         marketplaceFee = _marketplaceFee;
     }
 
-    /**
-     * @dev Whitelists or removes an NFT contract from trading
-     * @param nftContract The NFT contract address
-     * @param status Whether to whitelist (true) or remove (false)
-     */
+    // ------------------------------------------------------------------
+    // Admin
+    // ------------------------------------------------------------------
+
     function setNFTWhitelist(address nftContract, bool status) external onlyOwner {
-        require(nftContract != address(0), "Marketplace: invalid NFT address");
+        if (nftContract == address(0)) revert ZeroAddress();
         whitelistedNFTs[nftContract] = status;
         emit NFTWhitelisted(nftContract, status);
     }
 
-    /**
-     * @dev Updates the marketplace fee
-     * @param newFee The new fee in basis points
-     */
     function setMarketplaceFee(uint256 newFee) external onlyOwner {
-        require(newFee <= MAX_FEE, "Marketplace: fee too high");
+        if (newFee > MAX_FEE) revert FeeTooHigh(newFee, MAX_FEE);
         uint256 oldFee = marketplaceFee;
         marketplaceFee = newFee;
         emit MarketplaceFeeUpdated(oldFee, newFee);
     }
 
-    /**
-     * @dev Lists an NFT for sale
-     * @param nftContract The NFT contract address
-     * @param tokenId The token ID to list
-     * @param price The price in FGOLD tokens
-     * @return listingId The ID of the new listing
-     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // ------------------------------------------------------------------
+    // Trading
+    // ------------------------------------------------------------------
+
+    /// @notice Escrows `tokenId` and lists it for `price` FGOLD.
     function listItem(
         address nftContract,
         uint256 tokenId,
         uint256 price
-    ) external nonReentrant returns (uint256) {
-        require(whitelistedNFTs[nftContract], "Marketplace: NFT not whitelisted");
-        require(price > 0, "Marketplace: price must be greater than 0");
+    ) external nonReentrant whenNotPaused returns (uint256 listingId) {
+        if (!whitelistedNFTs[nftContract]) revert NotWhitelisted(nftContract);
+        if (price == 0) revert PriceMustBePositive();
 
         IERC721 nft = IERC721(nftContract);
-        require(nft.ownerOf(tokenId) == msg.sender, "Marketplace: not token owner");
-        require(
-            nft.isApprovedForAll(msg.sender, address(this)) ||
-            nft.getApproved(tokenId) == address(this),
-            "Marketplace: not approved"
-        );
+        if (nft.ownerOf(tokenId) != msg.sender) revert NotTokenOwner(tokenId, msg.sender);
+        if (
+            !nft.isApprovedForAll(msg.sender, address(this)) &&
+            nft.getApproved(tokenId) != address(this)
+        ) revert NotApproved(nftContract, tokenId);
 
-        // Check if already listed
-        uint256 existingListingId = nftToListingId[nftContract][tokenId];
-        if (existingListingId != 0 && listings[existingListingId].isActive) {
-            revert("Marketplace: already listed");
-        }
+        uint256 existing = nftToListingId[nftContract][tokenId];
+        if (existing != 0 && listings[existing].isActive) revert AlreadyListed(nftContract, tokenId);
 
-        // Transfer NFT to marketplace
-        nft.safeTransferFrom(msg.sender, address(this), tokenId);
-
-        // Create listing
-        uint256 listingId = ++listingIdCounter;
-
+        listingId = ++listingIdCounter;
         listings[listingId] = Listing({
             seller: msg.sender,
             nftContract: nftContract,
             tokenId: tokenId,
             price: price,
             listedAt: block.timestamp,
+            priceValidFrom: block.number,
             isActive: true
         });
 
         nftToListingId[nftContract][tokenId] = listingId;
-        sellerListings[msg.sender].push(listingId);
+        _sellerListings[msg.sender].push(listingId);
+        _addActiveListing(listingId);
+
+        nft.safeTransferFrom(msg.sender, address(this), tokenId);
 
         emit ItemListed(listingId, msg.sender, nftContract, tokenId, price);
-
-        return listingId;
     }
 
     /**
-     * @dev Buys a listed NFT
-     * @param listingId The ID of the listing
+     * @notice Buys a listing.
+     * @param maxPrice The most the buyer is willing to pay. Reverts if the
+     *        listing costs more, so a mempool reprice cannot overcharge them.
      */
-    function buyItem(uint256 listingId) external nonReentrant {
+    function buyItem(uint256 listingId, uint256 maxPrice) external nonReentrant whenNotPaused {
         Listing storage listing = listings[listingId];
-        require(listing.isActive, "Marketplace: listing not active");
-        require(msg.sender != listing.seller, "Marketplace: cannot buy own item");
+        if (!listing.isActive) revert ListingNotActive(listingId);
+        if (msg.sender == listing.seller) revert CannotBuyOwnItem(listingId);
 
         uint256 price = listing.price;
+        if (price > maxPrice) revert PriceExceedsMaximum(price, maxPrice);
+        // Reject a fill in the same block a price rise landed in.
+        if (listing.priceValidFrom > block.number) revert PriceJustChanged(listingId);
+
         address seller = listing.seller;
         address nftContract = listing.nftContract;
         uint256 tokenId = listing.tokenId;
 
-        // Calculate fee
         uint256 fee = (price * marketplaceFee) / FEE_DENOMINATOR;
         uint256 sellerProceeds = price - fee;
 
-        // Mark listing as inactive
+        // Effects first.
         listing.isActive = false;
         delete nftToListingId[nftContract][tokenId];
-
-        // Transfer FGOLD from buyer to seller
-        farmToken.transferFrom(msg.sender, seller, sellerProceeds);
-
-        // Transfer fee to marketplace
+        _removeActiveListing(listingId);
         if (fee > 0) {
-            farmToken.transferFrom(msg.sender, address(this), fee);
             accumulatedFees += fee;
         }
 
-        // Transfer NFT to buyer
+        // Interactions.
+        farmToken.safeTransferFrom(msg.sender, seller, sellerProceeds);
+        if (fee > 0) {
+            farmToken.safeTransferFrom(msg.sender, address(this), fee);
+        }
         IERC721(nftContract).safeTransferFrom(address(this), msg.sender, tokenId);
 
         emit ItemSold(listingId, seller, msg.sender, nftContract, tokenId, price, fee);
     }
 
-    /**
-     * @dev Cancels a listing and returns the NFT to the seller
-     * @param listingId The ID of the listing to cancel
-     */
+    /// @notice Cancels a listing and returns the escrowed NFT to its seller.
     function cancelListing(uint256 listingId) external nonReentrant {
         Listing storage listing = listings[listingId];
-        require(listing.isActive, "Marketplace: listing not active");
-        require(
-            msg.sender == listing.seller || msg.sender == owner(),
-            "Marketplace: not seller or owner"
-        );
+        if (!listing.isActive) revert ListingNotActive(listingId);
+        // Only the seller. The owner previously had this power too, which is
+        // an unnecessary lever over other people's trades.
+        if (msg.sender != listing.seller) revert NotSeller(listingId, msg.sender);
 
         address nftContract = listing.nftContract;
         uint256 tokenId = listing.tokenId;
         address seller = listing.seller;
 
-        // Mark listing as inactive
         listing.isActive = false;
         delete nftToListingId[nftContract][tokenId];
+        _removeActiveListing(listingId);
 
-        // Return NFT to seller
         IERC721(nftContract).safeTransferFrom(address(this), seller, tokenId);
 
         emit ListingCanceled(listingId, seller, nftContract, tokenId);
     }
 
     /**
-     * @dev Updates the price of a listing
-     * @param listingId The ID of the listing
-     * @param newPrice The new price in FGOLD tokens
+     * @notice Changes a listing's price.
+     * @dev A price *increase* defers `priceValidFrom` to the next block so it
+     *      cannot be sprung on a pending buy. Lowering the price takes effect
+     *      immediately - it can only ever help the buyer.
      */
-    function updateListingPrice(uint256 listingId, uint256 newPrice) external {
+    function updateListingPrice(uint256 listingId, uint256 newPrice) external whenNotPaused {
         Listing storage listing = listings[listingId];
-        require(listing.isActive, "Marketplace: listing not active");
-        require(msg.sender == listing.seller, "Marketplace: not seller");
-        require(newPrice > 0, "Marketplace: price must be greater than 0");
+        if (!listing.isActive) revert ListingNotActive(listingId);
+        if (msg.sender != listing.seller) revert NotSeller(listingId, msg.sender);
+        if (newPrice == 0) revert PriceMustBePositive();
 
         uint256 oldPrice = listing.price;
         listing.price = newPrice;
+        if (newPrice > oldPrice) {
+            listing.priceValidFrom = block.number + 1;
+        }
 
         emit ListingPriceUpdated(listingId, oldPrice, newPrice);
     }
 
-    /**
-     * @dev Gets a listing by ID
-     * @param listingId The ID of the listing
-     * @return The Listing struct
-     */
+    // ------------------------------------------------------------------
+    // Views
+    // ------------------------------------------------------------------
+
     function getListing(uint256 listingId) external view returns (Listing memory) {
         return listings[listingId];
     }
 
-    /**
-     * @dev Gets all active listings
-     * @param offset Starting index
-     * @param limit Maximum number of listings to return
-     * @return An array of active listings and their IDs
-     */
+    function activeListingCount() external view returns (uint256) {
+        return _activeListingIds.length;
+    }
+
+    /// @notice Page through active listings. O(limit), not O(all listings ever).
     function getActiveListings(
         uint256 offset,
         uint256 limit
-    ) external view returns (Listing[] memory, uint256[] memory) {
-        // Count active listings
-        uint256 activeCount = 0;
-        for (uint256 i = 1; i <= listingIdCounter; i++) {
-            if (listings[i].isActive) {
-                activeCount++;
-            }
-        }
-
-        // Calculate actual size to return
-        uint256 startIndex = offset;
-        uint256 size = limit;
-        if (startIndex >= activeCount) {
+    ) external view returns (Listing[] memory result, uint256[] memory ids) {
+        uint256 total = _activeListingIds.length;
+        if (offset >= total) {
             return (new Listing[](0), new uint256[](0));
         }
-        if (startIndex + size > activeCount) {
-            size = activeCount - startIndex;
+        uint256 size = total - offset;
+        if (size > limit) size = limit;
+
+        result = new Listing[](size);
+        ids = new uint256[](size);
+        for (uint256 i = 0; i < size; i++) {
+            uint256 listingId = _activeListingIds[offset + i];
+            ids[i] = listingId;
+            result[i] = listings[listingId];
         }
-
-        Listing[] memory result = new Listing[](size);
-        uint256[] memory ids = new uint256[](size);
-        uint256 resultIndex = 0;
-        uint256 skipped = 0;
-
-        for (uint256 i = 1; i <= listingIdCounter && resultIndex < size; i++) {
-            if (listings[i].isActive) {
-                if (skipped < offset) {
-                    skipped++;
-                } else {
-                    result[resultIndex] = listings[i];
-                    ids[resultIndex] = i;
-                    resultIndex++;
-                }
-            }
-        }
-
-        return (result, ids);
     }
 
-    /**
-     * @dev Gets all listings for a specific NFT contract
-     * @param nftContract The NFT contract address
-     * @return An array of listings and their IDs
-     */
-    function getListingsByNFT(
-        address nftContract
-    ) external view returns (Listing[] memory, uint256[] memory) {
-        // Count listings for this NFT contract
-        uint256 count = 0;
-        for (uint256 i = 1; i <= listingIdCounter; i++) {
-            if (listings[i].isActive && listings[i].nftContract == nftContract) {
-                count++;
-            }
-        }
-
-        Listing[] memory result = new Listing[](count);
-        uint256[] memory ids = new uint256[](count);
-        uint256 index = 0;
-
-        for (uint256 i = 1; i <= listingIdCounter && index < count; i++) {
-            if (listings[i].isActive && listings[i].nftContract == nftContract) {
-                result[index] = listings[i];
-                ids[index] = i;
-                index++;
-            }
-        }
-
-        return (result, ids);
-    }
-
-    /**
-     * @dev Gets all listings by a seller
-     * @param seller The seller's address
-     * @return An array of listings and their IDs
-     */
     function getListingsBySeller(
         address seller
-    ) external view returns (Listing[] memory, uint256[] memory) {
-        uint256[] storage listingIds = sellerListings[seller];
-
-        // Count active listings
-        uint256 activeCount = 0;
-        for (uint256 i = 0; i < listingIds.length; i++) {
-            if (listings[listingIds[i]].isActive) {
-                activeCount++;
-            }
+    ) external view returns (Listing[] memory result, uint256[] memory ids) {
+        uint256[] storage sellerIds = _sellerListings[seller];
+        uint256 activeCount;
+        for (uint256 i = 0; i < sellerIds.length; i++) {
+            if (listings[sellerIds[i]].isActive) activeCount++;
         }
 
-        Listing[] memory result = new Listing[](activeCount);
-        uint256[] memory ids = new uint256[](activeCount);
-        uint256 index = 0;
-
-        for (uint256 i = 0; i < listingIds.length && index < activeCount; i++) {
-            if (listings[listingIds[i]].isActive) {
-                result[index] = listings[listingIds[i]];
-                ids[index] = listingIds[i];
+        result = new Listing[](activeCount);
+        ids = new uint256[](activeCount);
+        uint256 index;
+        for (uint256 i = 0; i < sellerIds.length && index < activeCount; i++) {
+            if (listings[sellerIds[i]].isActive) {
+                result[index] = listings[sellerIds[i]];
+                ids[index] = sellerIds[i];
                 index++;
             }
         }
-
-        return (result, ids);
     }
 
-    /**
-     * @dev Gets the listing ID for a specific NFT
-     * @param nftContract The NFT contract address
-     * @param tokenId The token ID
-     * @return The listing ID (0 if not listed)
-     */
-    function getListingIdForNFT(
-        address nftContract,
-        uint256 tokenId
-    ) external view returns (uint256) {
-        return nftToListingId[nftContract][tokenId];
+    function getListingIdForNFT(address nftContract, uint256 tokenId) external view returns (uint256) {
+        uint256 listingId = nftToListingId[nftContract][tokenId];
+        if (listingId != 0 && !listings[listingId].isActive) return 0;
+        return listingId;
     }
 
-    /**
-     * @dev Withdraws accumulated marketplace fees
-     * @param recipient The address to receive the fees
-     */
-    function withdrawFees(address recipient) external onlyOwner {
-        require(recipient != address(0), "Marketplace: invalid recipient");
-        require(accumulatedFees > 0, "Marketplace: no fees to withdraw");
+    // ------------------------------------------------------------------
+    // Treasury / recovery
+    // ------------------------------------------------------------------
 
+    function withdrawFees(address recipient) external onlyOwner nonReentrant {
+        if (recipient == address(0)) revert ZeroAddress();
         uint256 amount = accumulatedFees;
+        if (amount == 0) revert NoFeesToWithdraw();
         accumulatedFees = 0;
-
-        farmToken.transfer(recipient, amount);
-
+        farmToken.safeTransfer(recipient, amount);
         emit FeesWithdrawn(recipient, amount);
     }
 
     /**
-     * @dev Emergency function to rescue stuck NFTs
-     * @param nftContract The NFT contract address
-     * @param tokenId The token ID
-     * @param recipient The address to receive the NFT
+     * @notice Recovers an NFT sent here outside the listing flow.
+     * @dev Reverts if the token backs an active listing, so escrowed goods
+     *      are not seizable by the operator.
      */
     function rescueNFT(
         address nftContract,
         uint256 tokenId,
         address recipient
-    ) external onlyOwner {
-        require(recipient != address(0), "Marketplace: invalid recipient");
-
-        // Check if there's an active listing
+    ) external onlyOwner nonReentrant {
+        if (recipient == address(0)) revert ZeroAddress();
         uint256 listingId = nftToListingId[nftContract][tokenId];
         if (listingId != 0 && listings[listingId].isActive) {
-            listings[listingId].isActive = false;
-            delete nftToListingId[nftContract][tokenId];
+            revert TokenIsListed(nftContract, tokenId);
         }
-
         IERC721(nftContract).safeTransferFrom(address(this), recipient, tokenId);
+        emit NFTRescued(nftContract, tokenId, recipient);
     }
 
-    /**
-     * @dev Updates the FarmToken contract address
-     * @param _farmToken The new FarmToken address
-     */
-    function updateFarmToken(address _farmToken) external onlyOwner {
-        require(_farmToken != address(0), "Marketplace: invalid token address");
-        farmToken = FarmToken(_farmToken);
+    // ------------------------------------------------------------------
+    // Active-listing index
+    // ------------------------------------------------------------------
+
+    function _addActiveListing(uint256 listingId) internal {
+        _activeListingIds.push(listingId);
+        _activeListingIndex[listingId] = _activeListingIds.length;
+    }
+
+    function _removeActiveListing(uint256 listingId) internal {
+        uint256 indexPlusOne = _activeListingIndex[listingId];
+        if (indexPlusOne == 0) return;
+        uint256 index = indexPlusOne - 1;
+        uint256 lastIndex = _activeListingIds.length - 1;
+        if (index != lastIndex) {
+            uint256 moved = _activeListingIds[lastIndex];
+            _activeListingIds[index] = moved;
+            _activeListingIndex[moved] = index + 1;
+        }
+        _activeListingIds.pop();
+        delete _activeListingIndex[listingId];
     }
 }

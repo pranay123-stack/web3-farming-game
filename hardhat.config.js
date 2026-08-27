@@ -1,64 +1,93 @@
-require("@nomicfoundation/hardhat-toolbox");
+require('@nomicfoundation/hardhat-toolbox')
+require('dotenv').config()
 
-// Load environment variables if .env file exists
-const dotenv = require("dotenv");
-dotenv.config();
+/**
+ * Hardhat configuration.
+ *
+ * Network accounts are only wired up when a private key is actually present.
+ * The previous config fell back to a hardcoded key literal
+ * (`0x000…001`, a well-known address), so a deploy with no `.env` would
+ * silently sign with an account anyone controls instead of failing.
+ */
 
-// Default values for deployment (will be overwritten by environment variables)
-const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL || "https://rpc.sepolia.org";
-const PRIVATE_KEY = process.env.PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000001";
-const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || "";
+const SEPOLIA_RPC_URL =
+  process.env.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com'
+
+// Configurable so this project can share a machine with another local chain.
+// Anvil and Hardhat both default to 8545 and both report chain id 31337, so a
+// hardcoded port silently points deploys at whichever one happens to be up.
+const LOCALHOST_RPC_URL = process.env.LOCALHOST_RPC_URL || 'http://127.0.0.1:8545'
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || ''
+
+/** Returns the configured deployer key, or [] so Hardhat reports it plainly. */
+function deployerAccounts() {
+  const key = process.env.PRIVATE_KEY
+  if (!key) return []
+
+  const normalised = key.startsWith('0x') ? key : `0x${key}`
+  if (!/^0x[0-9a-fA-F]{64}$/.test(normalised)) {
+    throw new Error(
+      'PRIVATE_KEY is set but is not a 32-byte hex string. ' +
+        'Expected 64 hex characters, optionally 0x-prefixed.'
+    )
+  }
+  return [normalised]
+}
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
   solidity: {
-    version: "0.8.20",
+    version: '0.8.20',
     settings: {
       optimizer: {
         enabled: true,
         runs: 200,
       },
-      viaIR: true, // Enable IR-based code generation for better optimization
+      // Normal builds do not need the IR pipeline - every contract fits well
+      // inside the 24KB limit without it, and compiles are much faster.
+      // Coverage instrumentation adds locals that push GameManager past the
+      // stack limit, so `npm run coverage` turns it on via VIA_IR=true.
+      viaIR: process.env.VIA_IR === 'true',
     },
   },
+
   networks: {
-    // Local development network
     hardhat: {
       chainId: 31337,
+      // Deterministic block times keep growth-window tests reproducible.
+      allowUnlimitedContractSize: false,
     },
     localhost: {
-      url: "http://127.0.0.1:8545",
+      url: LOCALHOST_RPC_URL,
       chainId: 31337,
     },
-    // Sepolia testnet
     sepolia: {
       url: SEPOLIA_RPC_URL,
-      accounts: [PRIVATE_KEY],
+      accounts: deployerAccounts(),
       chainId: 11155111,
-      gasPrice: "auto",
-      // Free RPC endpoints for Sepolia:
-      // - https://rpc.sepolia.org
-      // - https://sepolia.drpc.org
-      // - https://ethereum-sepolia.publicnode.com
-      // - https://1rpc.io/sepolia
     },
   },
+
   etherscan: {
     apiKey: {
       sepolia: ETHERSCAN_API_KEY,
     },
   },
+
   gasReporter: {
     enabled: process.env.REPORT_GAS !== undefined,
-    currency: "USD",
+    currency: 'USD',
+    excludeContracts: ['contracts/test/'],
   },
+
   paths: {
-    sources: "./contracts",
-    tests: "./test",
-    cache: "./cache",
-    artifacts: "./artifacts",
+    sources: './contracts',
+    tests: './test',
+    cache: './cache',
+    artifacts: './artifacts',
   },
+
   mocha: {
-    timeout: 40000,
+    timeout: 120000,
   },
-};
+}

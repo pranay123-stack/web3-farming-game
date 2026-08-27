@@ -1,7 +1,7 @@
 {
   "name": "gamefi-farming",
   "version": "1.0.0",
-  "description": "GameFi Farming Game Smart Contracts",
+  "description": "On-chain farming game: Solidity contracts, Phaser client and multiplayer server",
   "main": "index.js",
   "directories": {
     "test": "test"
@@ -9,10 +9,17 @@
   "scripts": {
     "compile": "hardhat compile",
     "test": "hardhat test",
+    "test:gas": "REPORT_GAS=true hardhat test",
+    "coverage": "VIA_IR=true hardhat coverage",
+    "node": "hardhat node",
+    "clean": "hardhat clean",
     "deploy:local": "hardhat run scripts/deploy.js --network localhost",
     "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia",
-    "node": "hardhat node",
-    "clean": "hardhat clean"
+    "verify:sepolia": "hardhat run scripts/verify.js --network sepolia",
+    "check:local": "hardhat run scripts/check-deployment.js --network localhost",
+    "check:sepolia": "hardhat run scripts/check-deployment.js --network sepolia",
+    "export:abi": "node scripts/export-abi.js",
+    "lint:sol": "solhint 'contracts/**/*.sol'"
   },
   "keywords": [
     "gamefi",

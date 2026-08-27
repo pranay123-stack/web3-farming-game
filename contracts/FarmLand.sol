@@ -4,217 +4,232 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
  * @title FarmLand
- * @dev ERC721 NFT contract for land plots in the farming game
- * Limited supply of 1000 plots with unique coordinates
+ * @notice ERC-721 land plots. Fixed supply, unique grid coordinates, and the
+ *         substrate every farming action is anchored to.
+ *
+ * @dev Locking
+ * ----------
+ * While a crop is growing the plot is locked. A locked plot cannot be
+ * transferred (enforced in {_update}), which is what makes `GameManager`'s
+ * "the land owner at harvest is the player who planted" assumption safe: the
+ * owner cannot change between plant and harvest.
+ *
+ * Token ids start at 1. Id 0 is reserved as the "no plot here" sentinel used
+ * by {coordinateToTokenId}; the previous version started at 0, making plot #0
+ * indistinguishable from an unminted coordinate.
  */
-contract FarmLand is ERC721, ERC721URIStorage, ERC721Enumerable, Ownable, ReentrancyGuard {
-    // Maximum number of land plots
-    uint256 public constant MAX_SUPPLY = 1000;
+contract FarmLand is ERC721, ERC721URIStorage, ERC721Enumerable, Ownable2Step, ReentrancyGuard {
+    using Strings for uint256;
 
-    // Grid dimensions (100x10 = 1000 plots)
+    uint256 public constant MAX_SUPPLY = 1000;
     uint256 public constant GRID_WIDTH = 100;
     uint256 public constant GRID_HEIGHT = 10;
+    uint256 public constant MAX_LEVEL = 10;
 
-    // Land plot data
+    /// @notice Fertility granted per upgrade level.
+    uint256 public constant FERTILITY_PER_LEVEL = 5;
+    uint256 public constant MIN_BASE_FERTILITY = 50;
+    uint256 public constant BASE_FERTILITY_RANGE = 51; // 50..100 inclusive
+
     struct LandPlot {
-        uint256 x;              // X coordinate (0-99)
-        uint256 y;              // Y coordinate (0-9)
-        uint256 fertility;      // Base fertility level (affects yields)
-        uint256 level;          // Upgrade level (0-10)
-        bool isLocked;          // Whether the land is locked for farming
-        uint256 lockedUntil;    // Timestamp when land becomes unlocked
-        uint256 plantedSeedId;  // ID of the planted seed NFT (0 if none)
-        uint256 plantedAt;      // Timestamp when seed was planted
-        bool isActive;          // Whether the plot exists
+        uint256 x;
+        uint256 y;
+        uint256 fertility;      // yield modifier, in percent
+        uint256 level;          // upgrade level, 0..MAX_LEVEL
+        bool isLocked;          // true while a crop is growing
+        uint256 lockedUntil;    // timestamp the crop matures
+        uint256 plantedSeedId;  // seed NFT that was consumed (0 if idle)
+        uint256 plantedAt;
+        bool exists;
     }
 
-    // Token ID counter
-    uint256 private _tokenIdCounter;
+    uint256 private _nextTokenId = 1;
 
-    // Mapping from token ID to LandPlot data
-    mapping(uint256 => LandPlot) public landPlots;
+    /// @dev Cursor for {mintLandAuto}. Monotonic, so auto-minting stays O(1)
+    ///      amortised instead of rescanning the whole grid on every mint.
+    uint256 private _autoMintCursor;
 
-    // Mapping from coordinates to token ID
-    mapping(uint256 => mapping(uint256 => uint256)) public coordinateToTokenId;
-
-    // Mapping to check if coordinates are taken
-    mapping(uint256 => mapping(uint256 => bool)) public coordinatesTaken;
-
-    // Mapping of addresses authorized to interact (game contracts)
+    mapping(uint256 => LandPlot) private _landPlots;
+    mapping(uint256 => mapping(uint256 => uint256)) public coordinateToTokenId; // x => y => tokenId (0 = none)
     mapping(address => bool) public operators;
 
-    // Price to mint a land plot (in native currency)
     uint256 public mintPrice;
-
-    // Base URI for metadata
     string private _baseTokenURI;
 
-    // Events
-    event LandMinted(
-        uint256 indexed tokenId,
-        address indexed to,
-        uint256 x,
-        uint256 y,
-        uint256 fertility
-    );
+    event LandMinted(uint256 indexed tokenId, address indexed to, uint256 x, uint256 y, uint256 fertility);
     event LandLocked(uint256 indexed tokenId, uint256 until, uint256 seedId);
     event LandUnlocked(uint256 indexed tokenId);
-    event LandUpgraded(uint256 indexed tokenId, uint256 newLevel);
+    event LandUpgraded(uint256 indexed tokenId, uint256 newLevel, uint256 newFertility);
     event OperatorAdded(address indexed account);
     event OperatorRemoved(address indexed account);
     event MintPriceUpdated(uint256 newPrice);
+    event BaseURIUpdated(string newBaseURI);
+    event Withdrawn(address indexed to, uint256 amount);
 
-    /**
-     * @dev Constructor initializes the land collection
-     * @param initialOwner The address that will own the contract
-     * @param baseURI The base URI for token metadata
-     * @param initialMintPrice The initial price to mint a land plot
-     */
+    error NotOperator(address caller);
+    error ZeroAddress();
+    error AlreadyOperator(address account);
+    error NotAnOperator(address account);
+    error MaxSupplyReached();
+    error CoordinateOutOfBounds(uint256 x, uint256 y);
+    error CoordinateTaken(uint256 x, uint256 y);
+    error InsufficientPayment(uint256 sent, uint256 required);
+    error PlotDoesNotExist(uint256 tokenId);
+    error PlotAlreadyLocked(uint256 tokenId);
+    error PlotNotLocked(uint256 tokenId);
+    error MaxLevelReached(uint256 tokenId);
+    error PlotIsLocked(uint256 tokenId);
+    error NothingToWithdraw();
+    error TransferFailed();
+    error NoAvailableCoordinates();
+
     constructor(
         address initialOwner,
         string memory baseURI,
         uint256 initialMintPrice
     ) ERC721("Farm Land", "FLAND") Ownable(initialOwner) {
+        if (initialOwner == address(0)) revert ZeroAddress();
         _baseTokenURI = baseURI;
         mintPrice = initialMintPrice;
     }
 
-    /**
-     * @dev Modifier to check if the caller is an operator
-     */
     modifier onlyOperator() {
-        require(operators[msg.sender] || msg.sender == owner(), "FarmLand: caller is not an operator");
+        if (!operators[msg.sender]) revert NotOperator(msg.sender);
         _;
     }
 
-    /**
-     * @dev Adds an address as an authorized operator
-     * @param account The address to add as an operator
-     */
     function addOperator(address account) external onlyOwner {
-        require(account != address(0), "FarmLand: operator is zero address");
-        require(!operators[account], "FarmLand: account is already an operator");
+        if (account == address(0)) revert ZeroAddress();
+        if (operators[account]) revert AlreadyOperator(account);
         operators[account] = true;
         emit OperatorAdded(account);
     }
 
-    /**
-     * @dev Removes an address from authorized operators
-     * @param account The address to remove as an operator
-     */
     function removeOperator(address account) external onlyOwner {
-        require(operators[account], "FarmLand: account is not an operator");
+        if (!operators[account]) revert NotAnOperator(account);
         operators[account] = false;
         emit OperatorRemoved(account);
     }
 
-    /**
-     * @dev Updates the mint price
-     * @param newPrice The new mint price
-     */
     function setMintPrice(uint256 newPrice) external onlyOwner {
         mintPrice = newPrice;
         emit MintPriceUpdated(newPrice);
     }
 
-    /**
-     * @dev Mints a land plot at specific coordinates
-     * @param to The address to receive the NFT
-     * @param x The X coordinate
-     * @param y The Y coordinate
-     * @return tokenId The ID of the newly minted token
-     */
+    // ------------------------------------------------------------------
+    // Minting
+    // ------------------------------------------------------------------
+
+    /// @notice Mints the plot at (`x`, `y`) to `to`. Payable at {mintPrice}.
     function mintLand(address to, uint256 x, uint256 y) external payable nonReentrant returns (uint256) {
-        require(to != address(0), "FarmLand: mint to zero address");
-        require(_tokenIdCounter < MAX_SUPPLY, "FarmLand: max supply reached");
-        require(x < GRID_WIDTH, "FarmLand: x coordinate out of bounds");
-        require(y < GRID_HEIGHT, "FarmLand: y coordinate out of bounds");
-        require(!coordinatesTaken[x][y], "FarmLand: coordinates already taken");
-
-        // Check payment (owner and operators can mint for free)
-        if (msg.sender != owner() && !operators[msg.sender]) {
-            require(msg.value >= mintPrice, "FarmLand: insufficient payment");
-        }
-
-        uint256 tokenId = _tokenIdCounter;
-        _tokenIdCounter++;
-
-        _safeMint(to, tokenId);
-
-        // Generate random fertility (50-100)
-        uint256 fertility = 50 + (uint256(keccak256(abi.encodePacked(block.timestamp, tokenId, x, y))) % 51);
-
-        landPlots[tokenId] = LandPlot({
-            x: x,
-            y: y,
-            fertility: fertility,
-            level: 0,
-            isLocked: false,
-            lockedUntil: 0,
-            plantedSeedId: 0,
-            plantedAt: 0,
-            isActive: true
-        });
-
-        coordinateToTokenId[x][y] = tokenId;
-        coordinatesTaken[x][y] = true;
-
-        // Generate token URI based on coordinates
-        string memory tokenURI_ = string(
-            abi.encodePacked(_baseTokenURI, "/land/", _toString(x), "-", _toString(y), ".json")
-        );
-        _setTokenURI(tokenId, tokenURI_);
-
-        emit LandMinted(tokenId, to, x, y, fertility);
-
+        if (x >= GRID_WIDTH || y >= GRID_HEIGHT) revert CoordinateOutOfBounds(x, y);
+        if (coordinateToTokenId[x][y] != 0) revert CoordinateTaken(x, y);
+        uint256 refund = _collectPayment();
+        uint256 tokenId = _mintPlot(to, x, y);
+        _refund(refund);
         return tokenId;
     }
 
     /**
-     * @dev Mints a land plot at the next available coordinates (auto-assign)
-     * @param to The address to receive the NFT
-     * @return tokenId The ID of the newly minted token
+     * @notice Mints the next free plot to `to`.
+     * @dev Walks a persistent cursor rather than rescanning the grid. The old
+     *      implementation ran a nested 100x10 loop of cold SLOADs on every
+     *      call, so minting the last plots cost more gas than a block allows.
      */
     function mintLandAuto(address to) external payable nonReentrant returns (uint256) {
-        require(to != address(0), "FarmLand: mint to zero address");
-        require(_tokenIdCounter < MAX_SUPPLY, "FarmLand: max supply reached");
+        uint256 refund = _collectPayment();
 
-        // Check payment (owner and operators can mint for free)
-        if (msg.sender != owner() && !operators[msg.sender]) {
-            require(msg.value >= mintPrice, "FarmLand: insufficient payment");
-        }
-
-        // Find next available coordinates
+        uint256 cursor = _autoMintCursor;
+        uint256 total = GRID_WIDTH * GRID_HEIGHT;
         uint256 x;
         uint256 y;
-        bool found = false;
+        bool found;
 
-        for (uint256 i = 0; i < GRID_WIDTH && !found; i++) {
-            for (uint256 j = 0; j < GRID_HEIGHT && !found; j++) {
-                if (!coordinatesTaken[i][j]) {
-                    x = i;
-                    y = j;
-                    found = true;
-                }
+        while (cursor < total) {
+            x = cursor / GRID_HEIGHT;
+            y = cursor % GRID_HEIGHT;
+            cursor++;
+            if (coordinateToTokenId[x][y] == 0) {
+                found = true;
+                break;
             }
         }
+        _autoMintCursor = cursor;
+        if (!found) revert NoAvailableCoordinates();
 
-        require(found, "FarmLand: no available coordinates");
+        uint256 tokenId = _mintPlot(to, x, y);
+        _refund(refund);
+        return tokenId;
+    }
 
-        uint256 tokenId = _tokenIdCounter;
-        _tokenIdCounter++;
+    /**
+     * @notice Operator-only free mint, used by the starter pack in `GameManager`.
+     * @dev Kept separate from the payable paths so the "operators mint free"
+     *      exemption is an explicit entry point rather than a branch inside a
+     *      user-facing payable function.
+     */
+    function mintLandFor(address to, uint256 x, uint256 y) external onlyOperator returns (uint256) {
+        if (x >= GRID_WIDTH || y >= GRID_HEIGHT) revert CoordinateOutOfBounds(x, y);
+        if (coordinateToTokenId[x][y] != 0) revert CoordinateTaken(x, y);
+        return _mintPlot(to, x, y);
+    }
 
-        _safeMint(to, tokenId);
+    /// @notice Operator-only free auto-mint (starter pack).
+    function mintLandAutoFor(address to) external onlyOperator returns (uint256) {
+        uint256 cursor = _autoMintCursor;
+        uint256 total = GRID_WIDTH * GRID_HEIGHT;
+        uint256 x;
+        uint256 y;
+        bool found;
 
-        // Generate random fertility (50-100)
-        uint256 fertility = 50 + (uint256(keccak256(abi.encodePacked(block.timestamp, tokenId, x, y))) % 51);
+        while (cursor < total) {
+            x = cursor / GRID_HEIGHT;
+            y = cursor % GRID_HEIGHT;
+            cursor++;
+            if (coordinateToTokenId[x][y] == 0) {
+                found = true;
+                break;
+            }
+        }
+        _autoMintCursor = cursor;
+        if (!found) revert NoAvailableCoordinates();
 
-        landPlots[tokenId] = LandPlot({
+        return _mintPlot(to, x, y);
+    }
+
+    function _collectPayment() internal returns (uint256 refund) {
+        uint256 price = mintPrice;
+        if (msg.value < price) revert InsufficientPayment(msg.value, price);
+        refund = msg.value - price;
+    }
+
+    /// @dev Returns overpayment instead of silently keeping it.
+    function _refund(uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+    }
+
+    function _mintPlot(address to, uint256 x, uint256 y) internal returns (uint256) {
+        if (to == address(0)) revert ZeroAddress();
+        if (_nextTokenId > MAX_SUPPLY) revert MaxSupplyReached();
+
+        uint256 tokenId = _nextTokenId++;
+
+        // Pseudo-random fertility. Miner-influenceable within a narrow band and
+        // deliberately so: it is a cosmetic yield modifier (50-100%), not a
+        // reward that would repay the cost of manipulating it. Documented
+        // rather than papered over with a VRF the game does not need.
+        uint256 fertility = MIN_BASE_FERTILITY +
+            (uint256(keccak256(abi.encodePacked(blockhash(block.number - 1), tokenId, x, y, to))) % BASE_FERTILITY_RANGE);
+
+        _landPlots[tokenId] = LandPlot({
             x: x,
             y: y,
             fertility: fertility,
@@ -223,186 +238,153 @@ contract FarmLand is ERC721, ERC721URIStorage, ERC721Enumerable, Ownable, Reentr
             lockedUntil: 0,
             plantedSeedId: 0,
             plantedAt: 0,
-            isActive: true
+            exists: true
         });
 
         coordinateToTokenId[x][y] = tokenId;
-        coordinatesTaken[x][y] = true;
 
-        // Generate token URI
-        string memory tokenURI_ = string(
-            abi.encodePacked(_baseTokenURI, "/land/", _toString(x), "-", _toString(y), ".json")
-        );
-        _setTokenURI(tokenId, tokenURI_);
+        _safeMint(to, tokenId);
+        _setTokenURI(tokenId, string(abi.encodePacked("land/", x.toString(), "-", y.toString(), ".json")));
 
         emit LandMinted(tokenId, to, x, y, fertility);
-
         return tokenId;
     }
 
-    /**
-     * @dev Locks a land plot for farming
-     * @param tokenId The ID of the land plot
-     * @param duration How long to lock the land
-     * @param seedId The ID of the planted seed NFT
-     */
+    // ------------------------------------------------------------------
+    // Farming state (operator-only)
+    // ------------------------------------------------------------------
+
     function lockLand(uint256 tokenId, uint256 duration, uint256 seedId) external onlyOperator {
-        require(landPlots[tokenId].isActive, "FarmLand: land does not exist");
-        require(!landPlots[tokenId].isLocked, "FarmLand: land already locked");
+        LandPlot storage plot = _landPlots[tokenId];
+        if (!plot.exists) revert PlotDoesNotExist(tokenId);
+        if (plot.isLocked) revert PlotAlreadyLocked(tokenId);
 
-        landPlots[tokenId].isLocked = true;
-        landPlots[tokenId].lockedUntil = block.timestamp + duration;
-        landPlots[tokenId].plantedSeedId = seedId;
-        landPlots[tokenId].plantedAt = block.timestamp;
+        plot.isLocked = true;
+        plot.lockedUntil = block.timestamp + duration;
+        plot.plantedSeedId = seedId;
+        plot.plantedAt = block.timestamp;
 
-        emit LandLocked(tokenId, landPlots[tokenId].lockedUntil, seedId);
+        emit LandLocked(tokenId, plot.lockedUntil, seedId);
     }
 
-    /**
-     * @dev Unlocks a land plot after farming
-     * @param tokenId The ID of the land plot
-     */
     function unlockLand(uint256 tokenId) external onlyOperator {
-        require(landPlots[tokenId].isActive, "FarmLand: land does not exist");
-        require(landPlots[tokenId].isLocked, "FarmLand: land not locked");
+        LandPlot storage plot = _landPlots[tokenId];
+        if (!plot.exists) revert PlotDoesNotExist(tokenId);
+        if (!plot.isLocked) revert PlotNotLocked(tokenId);
 
-        landPlots[tokenId].isLocked = false;
-        landPlots[tokenId].lockedUntil = 0;
-        landPlots[tokenId].plantedSeedId = 0;
-        landPlots[tokenId].plantedAt = 0;
+        plot.isLocked = false;
+        plot.lockedUntil = 0;
+        plot.plantedSeedId = 0;
+        plot.plantedAt = 0;
 
         emit LandUnlocked(tokenId);
     }
 
-    /**
-     * @dev Upgrades a land plot
-     * @param tokenId The ID of the land plot
-     */
     function upgradeLand(uint256 tokenId) external onlyOperator {
-        require(landPlots[tokenId].isActive, "FarmLand: land does not exist");
-        require(landPlots[tokenId].level < 10, "FarmLand: max level reached");
+        LandPlot storage plot = _landPlots[tokenId];
+        if (!plot.exists) revert PlotDoesNotExist(tokenId);
+        if (plot.isLocked) revert PlotIsLocked(tokenId);
+        if (plot.level >= MAX_LEVEL) revert MaxLevelReached(tokenId);
 
-        landPlots[tokenId].level++;
+        plot.level += 1;
+        plot.fertility += FERTILITY_PER_LEVEL;
 
-        // Increase fertility with each upgrade
-        landPlots[tokenId].fertility += 5;
-
-        emit LandUpgraded(tokenId, landPlots[tokenId].level);
+        emit LandUpgraded(tokenId, plot.level, plot.fertility);
     }
 
-    /**
-     * @dev Gets the land plot data
-     * @param tokenId The ID of the land plot
-     * @return The LandPlot struct
-     */
+    // ------------------------------------------------------------------
+    // Views
+    // ------------------------------------------------------------------
+
     function getLandPlot(uint256 tokenId) external view returns (LandPlot memory) {
-        require(landPlots[tokenId].isActive, "FarmLand: land does not exist");
-        return landPlots[tokenId];
+        if (!_landPlots[tokenId].exists) revert PlotDoesNotExist(tokenId);
+        return _landPlots[tokenId];
     }
 
-    /**
-     * @dev Checks if a land plot is ready to harvest
-     * @param tokenId The ID of the land plot
-     * @return bool True if ready to harvest
-     */
+    function plotExists(uint256 tokenId) external view returns (bool) {
+        return _landPlots[tokenId].exists;
+    }
+
     function isReadyToHarvest(uint256 tokenId) external view returns (bool) {
-        if (!landPlots[tokenId].isActive || !landPlots[tokenId].isLocked) {
-            return false;
-        }
-        return block.timestamp >= landPlots[tokenId].lockedUntil;
+        LandPlot storage plot = _landPlots[tokenId];
+        if (!plot.exists || !plot.isLocked) return false;
+        return block.timestamp >= plot.lockedUntil;
     }
 
-    /**
-     * @dev Gets all land plots owned by an address
-     * @param owner The address to query
-     * @return An array of token IDs
-     */
     function getLandsByOwner(address owner) external view returns (uint256[] memory) {
         uint256 balance = balanceOf(owner);
         uint256[] memory tokens = new uint256[](balance);
-
         for (uint256 i = 0; i < balance; i++) {
             tokens[i] = tokenOfOwnerByIndex(owner, i);
         }
-
         return tokens;
     }
 
-    /**
-     * @dev Gets the token ID at specific coordinates
-     * @param x The X coordinate
-     * @param y The Y coordinate
-     * @return tokenId The token ID (0 if not minted)
-     */
+    /// @notice Paginated plots-with-data read, so the client needs one call.
+    function getPlotsByOwner(
+        address owner,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (uint256[] memory tokenIds, LandPlot[] memory plots) {
+        uint256 balance = balanceOf(owner);
+        if (offset >= balance) {
+            return (new uint256[](0), new LandPlot[](0));
+        }
+        uint256 size = balance - offset;
+        if (size > limit) size = limit;
+
+        tokenIds = new uint256[](size);
+        plots = new LandPlot[](size);
+        for (uint256 i = 0; i < size; i++) {
+            uint256 tokenId = tokenOfOwnerByIndex(owner, offset + i);
+            tokenIds[i] = tokenId;
+            plots[i] = _landPlots[tokenId];
+        }
+    }
+
+    /// @notice Token id at (`x`, `y`), or 0 when that coordinate is unminted.
     function getTokenIdByCoordinates(uint256 x, uint256 y) external view returns (uint256) {
-        require(coordinatesTaken[x][y], "FarmLand: coordinates not minted");
         return coordinateToTokenId[x][y];
     }
 
-    /**
-     * @dev Gets the current supply
-     * @return The number of minted land plots
-     */
     function getCurrentSupply() external view returns (uint256) {
-        return _tokenIdCounter;
+        return _nextTokenId - 1;
     }
 
-    /**
-     * @dev Sets the base URI
-     * @param baseURI The new base URI
-     */
     function setBaseURI(string memory baseURI) external onlyOwner {
         _baseTokenURI = baseURI;
+        emit BaseURIUpdated(baseURI);
     }
 
-    /**
-     * @dev Withdraws collected ETH to owner
-     */
-    function withdraw() external onlyOwner {
+    /// @dev Uses `call` rather than `transfer`: the 2300-gas stipend would
+    ///      make withdrawal impossible once ownership moves to a multisig.
+    function withdraw(address to) external onlyOwner nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
         uint256 balance = address(this).balance;
-        require(balance > 0, "FarmLand: no balance to withdraw");
-        payable(owner()).transfer(balance);
+        if (balance == 0) revert NothingToWithdraw();
+        (bool ok, ) = payable(to).call{value: balance}("");
+        if (!ok) revert TransferFailed();
+        emit Withdrawn(to, balance);
     }
 
-    /**
-     * @dev Internal function to convert uint to string
-     */
-    function _toString(uint256 value) internal pure returns (string memory) {
-        if (value == 0) {
-            return "0";
-        }
-        uint256 temp = value;
-        uint256 digits;
-        while (temp != 0) {
-            digits++;
-            temp /= 10;
-        }
-        bytes memory buffer = new bytes(digits);
-        while (value != 0) {
-            digits -= 1;
-            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
-            value /= 10;
-        }
-        return string(buffer);
-    }
-
-    /**
-     * @dev Returns the base URI
-     */
     function _baseURI() internal view override returns (string memory) {
         return _baseTokenURI;
     }
 
-    // Required overrides for multiple inheritance
+    // ------------------------------------------------------------------
+    // Multiple-inheritance overrides
+    // ------------------------------------------------------------------
 
+    /// @dev Blocks transfer of a plot with a crop growing on it. Mints
+    ///      (`from == 0`) and burns (`to == 0`) are exempt.
     function _update(
         address to,
         uint256 tokenId,
         address auth
     ) internal override(ERC721, ERC721Enumerable) returns (address) {
-        // Prevent transfer of locked land
-        if (to != address(0) && landPlots[tokenId].isActive && landPlots[tokenId].isLocked) {
-            revert("FarmLand: cannot transfer locked land");
+        address from = _ownerOf(tokenId);
+        if (from != address(0) && to != address(0) && _landPlots[tokenId].isLocked) {
+            revert PlotIsLocked(tokenId);
         }
         return super._update(to, tokenId, auth);
     }

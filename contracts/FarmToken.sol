@@ -3,96 +3,101 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /**
  * @title FarmToken
- * @dev ERC20 token for the GameFi farming game - "Farm Gold" (FGOLD)
- * Used as the primary in-game currency for rewards, crafting, and trading
+ * @notice "Farm Gold" (FGOLD) - the fungible in-game currency.
+ *
+ * @dev Supply model
+ * ----------------
+ * FGOLD is minted by authorised game contracts (the faucet in `GameManager`
+ * and crop harvests) and burned when players spend it (seeds, crafting, land
+ * upgrades). It is intentionally *uncapped* at the token layer because the
+ * emission schedule is a game-design parameter enforced by `GameManager`,
+ * not a monetary one. Two guards keep that honest:
+ *
+ *   1. Only addresses explicitly added via {addMinter} can mint. The
+ *      deployment scripts register exactly one: `GameManager`.
+ *   2. `MAX_MINT_PER_TX` bounds any single mint, so a compromised or buggy
+ *      minter cannot inflate supply to overflow in one transaction.
+ *
+ * The contract owner deliberately CANNOT mint. Ownership only administers the
+ * minter set, which makes the privileged surface auditable on-chain: watch
+ * {MinterAdded} / {MinterRemoved} and you have seen every possible inflation
+ * source.
+ *
+ * `Ownable2Step` is used so a mistyped ownership transfer cannot brick the
+ * game's admin functions.
+ *
+ * ERC20Permit is included so the frontend can offer gasless approvals for the
+ * spend allowance that `GameManager` requires (see {burnFrom}).
  */
-contract FarmToken is ERC20, ERC20Burnable, Ownable {
-    // Mapping of addresses authorized to mint tokens (game contracts)
+contract FarmToken is ERC20, ERC20Burnable, ERC20Permit, Ownable2Step {
+    /// @notice Upper bound on a single mint call. Sanity guard, not a supply cap.
+    uint256 public constant MAX_MINT_PER_TX = 1_000_000 ether;
+
+    /// @notice Addresses authorised to mint (game contracts only).
     mapping(address => bool) public minters;
 
-    // Events
     event MinterAdded(address indexed account);
     event MinterRemoved(address indexed account);
 
-    /**
-     * @dev Constructor initializes the token with name "Farm Gold" and symbol "FGOLD"
-     * @param initialOwner The address that will own the contract
-     */
-    constructor(address initialOwner) ERC20("Farm Gold", "FGOLD") Ownable(initialOwner) {
-        // Mint initial supply to the owner (1 million tokens for initial distribution)
-        _mint(initialOwner, 1_000_000 * 10 ** decimals());
-    }
+    error NotMinter(address caller);
+    error ZeroAddress();
+    error AlreadyMinter(address account);
+    error NotAMinter(address account);
+    error MintAmountTooLarge(uint256 amount, uint256 maximum);
 
     /**
-     * @dev Modifier to check if the caller is a minter
+     * @param initialOwner Address that will administer the minter set.
+     * @param initialSupply Tokens minted to `initialOwner` at deploy time. Used
+     *        to seed the treasury that backs the starter-pack faucet; pass 0
+     *        for a pure-emission deployment.
      */
+    constructor(
+        address initialOwner,
+        uint256 initialSupply
+    ) ERC20("Farm Gold", "FGOLD") ERC20Permit("Farm Gold") Ownable(initialOwner) {
+        if (initialOwner == address(0)) revert ZeroAddress();
+        if (initialSupply > 0) {
+            _mint(initialOwner, initialSupply);
+        }
+    }
+
     modifier onlyMinter() {
-        require(minters[msg.sender] || msg.sender == owner(), "FarmToken: caller is not a minter");
+        if (!minters[msg.sender]) revert NotMinter(msg.sender);
         _;
     }
 
-    /**
-     * @dev Adds an address as an authorized minter
-     * @param account The address to add as a minter
-     */
+    /// @notice Authorises `account` to mint FGOLD.
     function addMinter(address account) external onlyOwner {
-        require(account != address(0), "FarmToken: minter is zero address");
-        require(!minters[account], "FarmToken: account is already a minter");
+        if (account == address(0)) revert ZeroAddress();
+        if (minters[account]) revert AlreadyMinter(account);
         minters[account] = true;
         emit MinterAdded(account);
     }
 
-    /**
-     * @dev Removes an address from authorized minters
-     * @param account The address to remove as a minter
-     */
+    /// @notice Revokes minting rights from `account`.
     function removeMinter(address account) external onlyOwner {
-        require(minters[account], "FarmToken: account is not a minter");
+        if (!minters[account]) revert NotAMinter(account);
         minters[account] = false;
         emit MinterRemoved(account);
     }
 
     /**
-     * @dev Mints new tokens to a specified address
-     * Can only be called by authorized minters or the owner
-     * @param to The address to receive the minted tokens
-     * @param amount The amount of tokens to mint
+     * @notice Mints `amount` FGOLD to `to`. Restricted to registered minters.
+     * @dev The owner is deliberately excluded - see the contract-level notes.
      */
     function mint(address to, uint256 amount) external onlyMinter {
-        require(to != address(0), "FarmToken: mint to zero address");
+        if (to == address(0)) revert ZeroAddress();
+        if (amount > MAX_MINT_PER_TX) revert MintAmountTooLarge(amount, MAX_MINT_PER_TX);
         _mint(to, amount);
     }
 
-    /**
-     * @dev Burns tokens from the caller's account for crafting
-     * Inherited from ERC20Burnable
-     * @param amount The amount of tokens to burn
-     */
-    function burnForCrafting(uint256 amount) external {
-        _burn(msg.sender, amount);
-    }
-
-    /**
-     * @dev Burns tokens from a specified account (with allowance)
-     * Used by game contracts for crafting mechanics
-     * @param account The account to burn tokens from
-     * @param amount The amount of tokens to burn
-     */
-    function burnFrom(address account, uint256 amount) public override {
-        _spendAllowance(account, msg.sender, amount);
-        _burn(account, amount);
-    }
-
-    /**
-     * @dev Checks if an address is an authorized minter
-     * @param account The address to check
-     * @return bool True if the address is a minter
-     */
+    /// @notice True if `account` may mint FGOLD.
     function isMinter(address account) external view returns (bool) {
-        return minters[account] || account == owner();
+        return minters[account];
     }
 }
