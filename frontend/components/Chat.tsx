@@ -1,248 +1,158 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useMultiplayerState } from '@/hooks/useMultiplayer'
+import { shortAddress } from '@/lib/format'
+import { LIMITS } from '@/shared/protocol'
 
-interface ChatMessage {
-  id: string
-  type: 'player' | 'system'
-  username?: string
-  content: string
-  timestamp: Date
-}
+/**
+ * Multiplayer chat.
+ *
+ * Real messages over a real socket. The previous version faked replies with a
+ * setTimeout, so the "other players" were the client talking to itself.
+ *
+ * Message content is rendered as text via React's default escaping and never
+ * with dangerouslySetInnerHTML; the server sanitises on the way in as well.
+ */
+export function Chat() {
+  const { messages, sendChat, status, isConnected, self, error } = useMultiplayerState()
+  const [draft, setDraft] = useState('')
+  const [scope, setScope] = useState<'global' | 'nearby'>('global')
+  const [sendError, setSendError] = useState<string | null>(null)
+  const [sending, setSending] = useState(false)
 
-interface ChatProps {
-  playerAddress: string
-}
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const pinnedToBottom = useRef(true)
 
-export default function Chat({ playerAddress }: ChatProps) {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: '1',
-      type: 'system',
-      content: 'Welcome to GameFi Farming! Type /help for commands.',
-      timestamp: new Date(),
-    },
-    {
-      id: '2',
-      type: 'player',
-      username: 'Farmer_Joe',
-      content: 'Hey everyone! Just harvested my first golden pumpkin!',
-      timestamp: new Date(Date.now() - 60000),
-    },
-    {
-      id: '3',
-      type: 'player',
-      username: 'CryptoGardener',
-      content: 'Nice! I need 5 more wheat for the quest',
-      timestamp: new Date(Date.now() - 30000),
-    },
-    {
-      id: '4',
-      type: 'system',
-      content: 'New event: Double XP weekend starts in 2 hours!',
-      timestamp: new Date(Date.now() - 15000),
-    },
-  ])
-  const [inputValue, setInputValue] = useState('')
-  const [isMinimized, setIsMinimized] = useState(false)
-  const messagesEndRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  // Auto-scroll to bottom when new messages arrive
+  // Follow new messages only while the player is already at the bottom, so
+  // reading back through history is not yanked away.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const element = scrollRef.current
+    if (!element || !pinnedToBottom.current) return
+    element.scrollTop = element.scrollHeight
   }, [messages])
 
-  const formatTime = (date: Date) => {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  const handleScroll = () => {
+    const element = scrollRef.current
+    if (!element) return
+    const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+    pinnedToBottom.current = distanceFromBottom < 40
   }
 
-  const formatAddress = (address: string) => {
-    if (!address) return 'Anonymous'
-    return `${address.slice(0, 4)}...${address.slice(-4)}`
-  }
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    const content = draft.trim()
+    if (!content || sending) return
 
-  const handleSend = () => {
-    if (!inputValue.trim()) return
+    setSending(true)
+    setSendError(null)
+    const result = await sendChat(content, scope)
+    setSending(false)
 
-    // Handle commands
-    if (inputValue.startsWith('/')) {
-      handleCommand(inputValue)
-      setInputValue('')
-      return
+    if (result.ok) {
+      setDraft('')
+    } else {
+      setSendError(result.message)
     }
-
-    // Add player message
-    const newMessage: ChatMessage = {
-      id: Date.now().toString(),
-      type: 'player',
-      username: formatAddress(playerAddress),
-      content: inputValue,
-      timestamp: new Date(),
-    }
-
-    setMessages(prev => [...prev, newMessage])
-    setInputValue('')
-
-    // Simulate other player response (for demo)
-    setTimeout(() => {
-      const responses = [
-        'Good luck with your farming!',
-        'Anyone want to trade seeds?',
-        'Just reached level 10!',
-        'The market prices are crazy today',
-      ]
-      const randomResponse = responses[Math.floor(Math.random() * responses.length)]
-      const botMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        type: 'player',
-        username: `Farmer_${Math.floor(Math.random() * 1000)}`,
-        content: randomResponse,
-        timestamp: new Date(),
-      }
-      setMessages(prev => [...prev, botMessage])
-    }, 2000 + Math.random() * 3000)
-  }
-
-  const handleCommand = (command: string) => {
-    const cmd = command.toLowerCase().trim()
-    let response = ''
-
-    switch (cmd) {
-      case '/help':
-        response = 'Commands: /help, /stats, /online, /trade, /emote [name]'
-        break
-      case '/stats':
-        response = 'Your stats: Level 5 | Harvests: 42 | FARM: 1000'
-        break
-      case '/online':
-        response = 'Players online: 127 | In your area: 5'
-        break
-      case '/trade':
-        response = 'Trade system coming soon! Stay tuned.'
-        break
-      default:
-        if (cmd.startsWith('/emote ')) {
-          const emote = cmd.replace('/emote ', '')
-          response = `* ${formatAddress(playerAddress)} ${emote} *`
-        } else {
-          response = `Unknown command: ${cmd}. Type /help for available commands.`
-        }
-    }
-
-    const systemMessage: ChatMessage = {
-      id: Date.now().toString(),
-      type: 'system',
-      content: response,
-      timestamp: new Date(),
-    }
-    setMessages(prev => [...prev, systemMessage])
-  }
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
-  }
-
-  if (isMinimized) {
-    return (
-      <div className="h-8 bg-game-dark/90 border-t border-game-border flex items-center justify-between px-3">
-        <span className="font-pixel text-game-primary text-xs">Chat</span>
-        <button
-          onClick={() => setIsMinimized(false)}
-          className="text-slate-400 hover:text-white transition"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
-          </svg>
-        </button>
-      </div>
-    )
   }
 
   return (
-    <div className="h-full flex flex-col bg-game-dark/50">
-      {/* Header */}
-      <div className="p-2 border-b border-game-border flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="font-pixel text-game-primary text-xs">Chat</span>
-          <span className="text-[10px] text-slate-500">Global</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <div className="w-2 h-2 bg-game-primary rounded-full animate-pulse" />
-          <span className="text-[10px] text-slate-400">127 online</span>
-          <button
-            onClick={() => setIsMinimized(true)}
-            className="ml-2 text-slate-400 hover:text-white transition"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-2 space-y-1">
-        {messages.map((message) => (
-          <div
-            key={message.id}
-            className={`chat-message ${message.type}`}
-          >
-            {message.type === 'system' ? (
-              <span className="text-game-accent italic text-xs">
-                [{formatTime(message.timestamp)}] {message.content}
-              </span>
-            ) : (
-              <span className="text-xs">
-                <span className="text-slate-500">[{formatTime(message.timestamp)}]</span>
-                {' '}
-                <span className="text-game-primary font-bold">{message.username}:</span>
-                {' '}
-                <span className="text-slate-300">{message.content}</span>
-              </span>
-            )}
-          </div>
-        ))}
-        <div ref={messagesEndRef} />
-      </div>
-
-      {/* Input */}
-      <div className="p-2 border-t border-game-border">
-        <div className="flex gap-2">
-          <input
-            ref={inputRef}
-            type="text"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type a message..."
-            className="flex-1 bg-game-darker border border-game-border rounded px-2 py-1 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-game-primary transition"
-          />
-          <button
-            onClick={handleSend}
-            disabled={!inputValue.trim()}
-            className="btn-secondary px-2 py-1 text-xs disabled:opacity-50"
-          >
-            Send
-          </button>
-        </div>
-
-        {/* Quick Emotes */}
-        <div className="flex gap-1 mt-2">
-          {['👋', '👍', '🎉', '❤️', '😂'].map((emote) => (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center justify-between px-3 py-2">
+        <h2 className="heading">Chat</h2>
+        <div className="flex gap-1">
+          {(['global', 'nearby'] as const).map((option) => (
             <button
-              key={emote}
-              onClick={() => setInputValue(prev => prev + emote)}
-              className="w-6 h-6 flex items-center justify-center hover:bg-game-border rounded transition text-sm"
+              key={option}
+              onClick={() => setScope(option)}
+              className={`rounded px-2 py-0.5 text-[11px] font-medium transition ${
+                scope === option
+                  ? 'bg-leaf-500 text-soil-950'
+                  : 'bg-soil-800 text-text-secondary hover:text-text-primary'
+              }`}
             >
-              {emote}
+              {option === 'global' ? 'Global' : 'Nearby'}
             </button>
           ))}
         </div>
       </div>
+
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="scrollbar-thin flex-1 space-y-1.5 overflow-y-auto px-3 pb-2"
+        role="log"
+        aria-live="polite"
+        aria-label="Chat messages"
+      >
+        {messages.length === 0 ? (
+          <p className="py-6 text-center text-xs text-text-muted">
+            {isConnected
+              ? 'No messages yet. Say hello.'
+              : status === 'reconnecting' || status === 'connecting'
+                ? 'Connecting to the farm…'
+                : 'Chat is offline.'}
+          </p>
+        ) : (
+          messages.map((message) => {
+            const isSelf = self && message.senderId === self.id
+            const isSystem = message.scope === 'system'
+
+            if (isSystem) {
+              return (
+                <p key={message.id} className="text-center text-[11px] italic text-text-muted">
+                  {message.content}
+                </p>
+              )
+            }
+
+            return (
+              <div key={message.id} className="text-xs leading-snug">
+                <span
+                  className={
+                    isSelf ? 'font-medium text-leaf-400'
+                    : message.scope === 'nearby' ? 'font-medium text-sky-500'
+                    : 'font-medium text-text-secondary'
+                  }
+                  title={message.senderAddress ?? 'Guest'}
+                >
+                  {isSelf ? 'You' : message.senderName}
+                  {message.scope === 'nearby' && (
+                    <span className="ml-1 text-[10px] font-normal text-text-muted">nearby</span>
+                  )}
+                </span>
+                <span className="mx-1 text-text-muted">·</span>
+                <span className="break-words text-text-primary">{message.content}</span>
+              </div>
+            )
+          })
+        )}
+      </div>
+
+      {(error || sendError) && (
+        <p className="px-3 pb-1 text-[11px] text-rose-500">{sendError ?? error}</p>
+      )}
+
+      <form onSubmit={submit} className="flex gap-1.5 px-3 pb-3">
+        <input
+          className="input text-xs"
+          value={draft}
+          maxLength={LIMITS.maxChatLength}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={isConnected ? `Message ${scope}…` : 'Connecting…'}
+          disabled={!isConnected || sending}
+          aria-label="Chat message"
+        />
+        <button
+          type="submit"
+          className="btn-secondary shrink-0 px-3 text-xs"
+          disabled={!isConnected || sending || draft.trim().length === 0}
+        >
+          {sending ? '…' : 'Send'}
+        </button>
+      </form>
     </div>
   )
 }
+
+export default Chat

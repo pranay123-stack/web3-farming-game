@@ -1,664 +1,532 @@
 import Phaser from 'phaser'
 import { Player } from '../sprites/Player'
+import { TILE_SIZE, type SceneBridge, type SceneInit, type ScenePlot, type SceneRemotePlayer } from '../types'
+import { WORLD, type Facing } from '@/shared/protocol'
 
-// Tile types
+/**
+ * The farm world.
+ *
+ * The scene draws whatever plot data it is given and reports player intent
+ * back through the bridge. It holds no authority: it never decides that a crop
+ * is harvestable, only that the player asked to harvest one. The contract
+ * decides, and the result flows back in as new plot data.
+ *
+ * Plots are keyed by their real land token id. The previous scene invented
+ * plot ids from tile coordinates (`tileX * mapWidth + tileY`), which had no
+ * relationship to any NFT, so clicking a tile could only ever fail.
+ */
+
 const TILE_GRASS = 0
 const TILE_DIRT = 1
 const TILE_WATER = 2
-const TILE_FENCE = 3
-const TILE_PATH = 4
+const TILE_PATH = 3
 
-// Crop stages
-const CROP_EMPTY = 0
-const CROP_PLANTED = 1
-const CROP_GROWING = 2
-const CROP_READY = 3
-
-interface FarmPlot {
-  tileX: number
-  tileY: number
-  stage: number
-  cropType: number
-  plantedAt: number
-  graphics: Phaser.GameObjects.Container
+const TILE_COLORS: Record<number, number> = {
+  [TILE_GRASS]: 0x3f5c35,
+  [TILE_DIRT]: 0x5c4632,
+  [TILE_WATER]: 0x2f5d7c,
+  [TILE_PATH]: 0x7a6a52,
 }
 
-interface OtherPlayer {
-  id: string
-  player: Player
-  lastUpdate: number
-}
+const MOVE_SPEED = 150 // pixels per second
+const NETWORK_TICK_MS = 80
 
-interface MainSceneConfig {
-  playerAddress: string
-  selectedAction: 'plant' | 'harvest' | 'craft' | null
-  onPlant: (plotId: number, seedType: number) => void
-  onHarvest: (plotId: number) => void
+interface PlotVisual {
+  container: Phaser.GameObjects.Container
+  soil: Phaser.GameObjects.Rectangle
+  cropText: Phaser.GameObjects.Text
+  progressBg: Phaser.GameObjects.Rectangle
+  progressBar: Phaser.GameObjects.Rectangle
+  levelPips: Phaser.GameObjects.Graphics
+  readyRing: Phaser.GameObjects.Arc
+  plot: ScenePlot
 }
 
 export class MainScene extends Phaser.Scene {
-  // Configuration
-  private config: MainSceneConfig
-  private mapWidth: number = 32
-  private mapHeight: number = 32
-  private tileSize: number = 32
+  private bridge!: SceneBridge
+  private playerAddress: string | null = null
 
-  // Player
-  private localPlayer!: Player
-  private otherPlayers: Map<string, OtherPlayer> = new Map()
-
-  // Map data
   private tileMap: number[][] = []
-  private farmPlots: Map<string, FarmPlot> = new Map()
-
-  // Input
-  private cursors!: Phaser.Types.Input.Keyboard.CursorKeys
-  private wasdKeys!: {
-    W: Phaser.Input.Keyboard.Key
-    A: Phaser.Input.Keyboard.Key
-    S: Phaser.Input.Keyboard.Key
-    D: Phaser.Input.Keyboard.Key
-  }
-
-  // Graphics layers
   private groundLayer!: Phaser.GameObjects.Container
-  private objectLayer!: Phaser.GameObjects.Container
-  private uiLayer!: Phaser.GameObjects.Container
+  private plotLayer!: Phaser.GameObjects.Container
 
-  // State
-  private lastMoveTime: number = 0
-  private moveDelay: number = 150 // ms between moves
-  private selectedPlot: FarmPlot | null = null
-  private hoverTile: { x: number; y: number } | null = null
+  private localPlayer!: Player
+  private remotePlayers = new Map<string, Player>()
+
+  private plotVisuals = new Map<string, PlotVisual>()
+  private selectedPlotId: string | null = null
+  private selectionMarker!: Phaser.GameObjects.Rectangle
+
+  private cursors!: Phaser.Types.Input.Keyboard.CursorKeys
+  private wasd!: Record<'W' | 'A' | 'S' | 'D', Phaser.Input.Keyboard.Key>
+
+  private facing: Facing = 'down'
+  private lastNetworkSend = 0
+  private lastSentX = -1
+  private lastSentY = -1
+
+  // Timers and listeners registered here are torn down in shutdown().
+  private teardown: Array<() => void> = []
 
   constructor() {
     super({ key: 'MainScene' })
-    this.config = {
-      playerAddress: '',
-      selectedAction: null,
-      onPlant: () => {},
-      onHarvest: () => {},
-    }
   }
 
-  init(data: MainSceneConfig): void {
-    this.config = data
+  init(data: SceneInit): void {
+    this.bridge = data.bridge
+    this.playerAddress = data.playerAddress
   }
 
   create(): void {
-    // Create layers
-    this.groundLayer = this.add.container(0, 0)
-    this.objectLayer = this.add.container(0, 0)
-    this.uiLayer = this.add.container(0, 0)
+    this.groundLayer = this.add.container(0, 0).setDepth(0)
+    this.plotLayer = this.add.container(0, 0).setDepth(10)
 
-    // Generate and render map
-    this.generateMap()
-    this.renderMap()
+    this.generateWorld()
+    this.renderWorld()
 
-    // Create farm plots
-    this.createFarmPlots()
+    this.selectionMarker = this.add
+      .rectangle(0, 0, TILE_SIZE, TILE_SIZE)
+      .setStrokeStyle(2, 0x86c06a)
+      .setDepth(20)
+      .setVisible(false)
 
-    // Create local player
     this.createLocalPlayer()
-
-    // Create some other players for demo
-    this.createDemoPlayers()
-
-    // Setup input
     this.setupInput()
-
-    // Setup camera
     this.setupCamera()
 
-    // Setup pointer events
-    this.setupPointerEvents()
+    // Phaser keeps running after the canvas is destroyed unless every listener
+    // is removed; this is where that contract is made explicit.
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.shutdownScene())
+    this.events.once(Phaser.Scenes.Events.DESTROY, () => this.shutdownScene())
 
-    // Emit ready event
-    this.events.emit('gameReady')
+    this.events.emit('scene-ready')
   }
 
-  private generateMap(): void {
-    // Initialize with grass
-    this.tileMap = Array(this.mapHeight).fill(null).map(() =>
-      Array(this.mapWidth).fill(TILE_GRASS)
-    )
+  // ------------------------------------------------------------------ world
 
-    // Add some water (pond in corner)
-    for (let y = 2; y < 6; y++) {
-      for (let x = 2; x < 7; x++) {
-        this.tileMap[y][x] = TILE_WATER
-      }
+  private generateWorld(): void {
+    const { width, height } = WORLD
+    this.tileMap = Array.from({ length: height }, () => Array<number>(width).fill(TILE_GRASS))
+
+    // A pond, for orientation and to give the map a landmark.
+    for (let y = 4; y < 10; y++) {
+      for (let x = 4; x < 12; x++) this.tileMap[y][x] = TILE_WATER
     }
 
-    // Add paths
-    for (let x = 10; x < this.mapWidth - 2; x++) {
-      this.tileMap[15][x] = TILE_PATH
-    }
-    for (let y = 5; y < 25; y++) {
-      this.tileMap[y][10] = TILE_PATH
-    }
+    // Cross paths through the middle.
+    const midY = Math.floor(height / 2)
+    const midX = Math.floor(width / 2)
+    for (let x = 0; x < width; x++) this.tileMap[midY][x] = TILE_PATH
+    for (let y = 0; y < height; y++) this.tileMap[y][midX] = TILE_PATH
+  }
 
-    // Add fences around edges
-    for (let x = 0; x < this.mapWidth; x++) {
-      this.tileMap[0][x] = TILE_FENCE
-      this.tileMap[this.mapHeight - 1][x] = TILE_FENCE
-    }
-    for (let y = 0; y < this.mapHeight; y++) {
-      this.tileMap[y][0] = TILE_FENCE
-      this.tileMap[y][this.mapWidth - 1] = TILE_FENCE
-    }
+  private renderWorld(): void {
+    const { width, height } = WORLD
 
-    // Add dirt patches (farmable areas)
-    const dirtPatches = [
-      { x: 12, y: 5, w: 6, h: 4 },
-      { x: 12, y: 18, w: 6, h: 4 },
-      { x: 20, y: 5, w: 6, h: 4 },
-      { x: 20, y: 18, w: 6, h: 4 },
-    ]
+    // One texture-less Graphics object for the whole ground, rather than
+    // 4096 Rectangle game objects - the difference is a visible frame-rate
+    // cliff on a map this size.
+    const ground = this.add.graphics()
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const tile = this.tileMap[y][x]
+        ground.fillStyle(TILE_COLORS[tile], 1)
+        ground.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
 
-    for (const patch of dirtPatches) {
-      for (let y = patch.y; y < patch.y + patch.h; y++) {
-        for (let x = patch.x; x < patch.x + patch.w; x++) {
-          if (y < this.mapHeight && x < this.mapWidth) {
-            this.tileMap[y][x] = TILE_DIRT
-          }
+        // Subtle checker so the grid reads without drawing gridlines.
+        if ((x + y) % 2 === 0) {
+          ground.fillStyle(0x000000, 0.05)
+          ground.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
         }
       }
     }
+    this.groundLayer.add(ground)
   }
 
-  private renderMap(): void {
-    const colors: Record<number, number> = {
-      [TILE_GRASS]: 0x4ade80,
-      [TILE_DIRT]: 0x8b5a2b,
-      [TILE_WATER]: 0x38bdf8,
-      [TILE_FENCE]: 0x78716c,
-      [TILE_PATH]: 0xd6d3d1,
-    }
-
-    for (let y = 0; y < this.mapHeight; y++) {
-      for (let x = 0; x < this.mapWidth; x++) {
-        const tileType = this.tileMap[y][x]
-        const color = colors[tileType] || 0x4ade80
-
-        // Base tile
-        const tile = this.add.rectangle(
-          x * this.tileSize + this.tileSize / 2,
-          y * this.tileSize + this.tileSize / 2,
-          this.tileSize - 1,
-          this.tileSize - 1,
-          color
-        )
-        tile.setStrokeStyle(1, Phaser.Display.Color.IntegerToColor(color).darken(20).color)
-        this.groundLayer.add(tile)
-
-        // Add details based on tile type
-        if (tileType === TILE_GRASS) {
-          // Random grass blades
-          if (Math.random() > 0.7) {
-            const grass = this.add.text(
-              x * this.tileSize + 8 + Math.random() * 16,
-              y * this.tileSize + 8 + Math.random() * 16,
-              Math.random() > 0.5 ? ',' : "'",
-              { fontSize: '12px', color: '#22c55e' }
-            )
-            this.groundLayer.add(grass)
-          }
-        } else if (tileType === TILE_WATER) {
-          // Water ripples
-          if (Math.random() > 0.8) {
-            const ripple = this.add.circle(
-              x * this.tileSize + 16,
-              y * this.tileSize + 16,
-              4,
-              0x7dd3fc,
-              0.5
-            )
-            this.groundLayer.add(ripple)
-
-            // Animate ripples
-            this.tweens.add({
-              targets: ripple,
-              alpha: 0,
-              scale: 2,
-              duration: 2000,
-              repeat: -1,
-              delay: Math.random() * 2000,
-            })
-          }
-        } else if (tileType === TILE_FENCE) {
-          // Fence post
-          const post = this.add.rectangle(
-            x * this.tileSize + this.tileSize / 2,
-            y * this.tileSize + this.tileSize / 2,
-            8,
-            this.tileSize - 4,
-            0x57534e
-          )
-          post.setStrokeStyle(1, 0x44403c)
-          this.objectLayer.add(post)
-        }
-      }
-    }
+  private isBlocked(tileX: number, tileY: number): boolean {
+    if (tileX < 0 || tileY < 0 || tileX >= WORLD.width || tileY >= WORLD.height) return true
+    return this.tileMap[tileY][tileX] === TILE_WATER
   }
 
-  private createFarmPlots(): void {
-    // Find all dirt tiles and create farm plots
-    let plotId = 0
-    for (let y = 0; y < this.mapHeight; y++) {
-      for (let x = 0; x < this.mapWidth; x++) {
-        if (this.tileMap[y][x] === TILE_DIRT) {
-          const plot = this.createFarmPlot(x, y, plotId++)
-          this.farmPlots.set(`${x},${y}`, plot)
-        }
-      }
-    }
-
-    // Add some demo crops
-    const demoCrops = [
-      { x: 13, y: 6, stage: CROP_READY, type: 1 },
-      { x: 14, y: 6, stage: CROP_GROWING, type: 1 },
-      { x: 15, y: 6, stage: CROP_PLANTED, type: 2 },
-      { x: 21, y: 6, stage: CROP_READY, type: 3 },
-      { x: 22, y: 6, stage: CROP_READY, type: 2 },
-    ]
-
-    for (const crop of demoCrops) {
-      const plot = this.farmPlots.get(`${crop.x},${crop.y}`)
-      if (plot) {
-        plot.stage = crop.stage
-        plot.cropType = crop.type
-        this.updatePlotGraphics(plot)
-      }
-    }
-  }
-
-  private createFarmPlot(tileX: number, tileY: number, plotId: number): FarmPlot {
-    const container = this.add.container(
-      tileX * this.tileSize + this.tileSize / 2,
-      tileY * this.tileSize + this.tileSize / 2
-    )
-    this.objectLayer.add(container)
-
-    const plot: FarmPlot = {
-      tileX,
-      tileY,
-      stage: CROP_EMPTY,
-      cropType: 0,
-      plantedAt: 0,
-      graphics: container,
-    }
-
-    return plot
-  }
-
-  private updatePlotGraphics(plot: FarmPlot): void {
-    // Clear existing graphics
-    plot.graphics.removeAll(true)
-
-    if (plot.stage === CROP_EMPTY) {
-      // Show empty soil lines
-      const lines = this.add.graphics()
-      lines.lineStyle(1, 0x6b4423, 0.5)
-      lines.lineBetween(-10, -5, 10, -5)
-      lines.lineBetween(-10, 0, 10, 0)
-      lines.lineBetween(-10, 5, 10, 5)
-      plot.graphics.add(lines)
-    } else {
-      // Show crop based on stage
-      const cropEmojis: Record<number, string[]> = {
-        1: ['🌱', '🌿', '🌾'], // Wheat
-        2: ['🌱', '🌿', '🌽'], // Corn
-        3: ['🌱', '🌿', '🍅'], // Tomato
-      }
-
-      const emojis = cropEmojis[plot.cropType] || cropEmojis[1]
-      let emoji = ''
-      let scale = 1
-
-      switch (plot.stage) {
-        case CROP_PLANTED:
-          emoji = emojis[0]
-          scale = 0.8
-          break
-        case CROP_GROWING:
-          emoji = emojis[1]
-          scale = 1
-          break
-        case CROP_READY:
-          emoji = emojis[2]
-          scale = 1.2
-          break
-      }
-
-      const cropText = this.add.text(0, 0, emoji, {
-        fontSize: `${20 * scale}px`,
-      })
-      cropText.setOrigin(0.5, 0.5)
-      plot.graphics.add(cropText)
-
-      // Add sparkle effect for ready crops
-      if (plot.stage === CROP_READY) {
-        const sparkle = this.add.text(8, -8, '✨', { fontSize: '10px' })
-        plot.graphics.add(sparkle)
-
-        this.tweens.add({
-          targets: sparkle,
-          alpha: 0.3,
-          duration: 500,
-          yoyo: true,
-          repeat: -1,
-        })
-      }
-    }
-  }
+  // ----------------------------------------------------------------- player
 
   private createLocalPlayer(): void {
-    // Start position (on a path)
-    const startX = 11
-    const startY = 12
+    const startX = Math.floor(WORLD.width / 2) * TILE_SIZE + TILE_SIZE / 2
+    const startY = (Math.floor(WORLD.height / 2) + 2) * TILE_SIZE + TILE_SIZE / 2
+    const label = this.playerAddress
+      ? `${this.playerAddress.slice(0, 6)}…${this.playerAddress.slice(-4)}`
+      : 'You'
 
-    this.localPlayer = new Player({
-      scene: this,
-      x: startX * this.tileSize + this.tileSize / 2,
-      y: startY * this.tileSize + this.tileSize / 2,
-      texture: 'player',
-      playerId: this.config.playerAddress || 'local',
-      isLocalPlayer: true,
-      username: this.config.playerAddress
-        ? `${this.config.playerAddress.slice(0, 6)}...`
-        : 'You',
-    })
-  }
-
-  private createDemoPlayers(): void {
-    // Add some demo players for multiplayer feel
-    const demoPositions = [
-      { x: 14, y: 7, id: '0x1234...5678' },
-      { x: 22, y: 19, id: '0xabcd...efgh' },
-      { x: 8, y: 20, id: '0x9876...5432' },
-    ]
-
-    for (const pos of demoPositions) {
-      const player = new Player({
-        scene: this,
-        x: pos.x * this.tileSize + this.tileSize / 2,
-        y: pos.y * this.tileSize + this.tileSize / 2,
-        texture: 'player',
-        playerId: pos.id,
-        isLocalPlayer: false,
-        username: pos.id,
-      })
-
-      this.otherPlayers.set(pos.id, {
-        id: pos.id,
-        player,
-        lastUpdate: Date.now(),
-      })
-
-      // Make them move randomly
-      this.time.addEvent({
-        delay: 2000 + Math.random() * 3000,
-        loop: true,
-        callback: () => {
-          const dx = Math.floor(Math.random() * 3) - 1
-          const dy = Math.floor(Math.random() * 3) - 1
-          player.moveByTile(dx, dy, this.tileSize)
-        },
-      })
-    }
+    this.localPlayer = new Player(this, startX, startY, label, true)
   }
 
   private setupInput(): void {
-    this.cursors = this.input.keyboard!.createCursorKeys()
-    this.wasdKeys = {
-      W: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.W),
-      A: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.A),
-      S: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.S),
-      D: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.D),
+    const keyboard = this.input.keyboard
+    if (!keyboard) return
+
+    this.cursors = keyboard.createCursorKeys()
+    this.wasd = keyboard.addKeys('W,A,S,D') as Record<'W' | 'A' | 'S' | 'D', Phaser.Input.Keyboard.Key>
+
+    // Stop WASD and arrows scrolling the page behind the canvas.
+    keyboard.addCapture(['W', 'A', 'S', 'D', 'UP', 'DOWN', 'LEFT', 'RIGHT', 'SPACE'])
+
+    const onPointerDown = (pointer: Phaser.Input.Pointer) => {
+      const world = this.cameras.main.getWorldPoint(pointer.x, pointer.y)
+      const tileX = Math.floor(world.x / TILE_SIZE)
+      const tileY = Math.floor(world.y / TILE_SIZE)
+      this.handleTileClick(tileX, tileY)
     }
+    this.input.on('pointerdown', onPointerDown)
+    this.teardown.push(() => this.input.off('pointerdown', onPointerDown))
+
+    const onWheel = (
+      _pointer: Phaser.Input.Pointer,
+      _objects: unknown,
+      _dx: number,
+      dy: number
+    ) => {
+      const camera = this.cameras.main
+      const next = Phaser.Math.Clamp(camera.zoom - dy * 0.001, 0.6, 2.2)
+      camera.setZoom(next)
+    }
+    this.input.on('wheel', onWheel)
+    this.teardown.push(() => this.input.off('wheel', onWheel))
   }
 
   private setupCamera(): void {
-    // Set world bounds
-    this.cameras.main.setBounds(
-      0,
-      0,
-      this.mapWidth * this.tileSize,
-      this.mapHeight * this.tileSize
-    )
-
-    // Follow player
-    this.cameras.main.startFollow(this.localPlayer, true, 0.1, 0.1)
-    this.cameras.main.setZoom(1.5)
-
-    // Add zoom controls
-    this.input.on('wheel', (pointer: Phaser.Input.Pointer, gameObjects: unknown[], deltaX: number, deltaY: number) => {
-      const currentZoom = this.cameras.main.zoom
-      const newZoom = Phaser.Math.Clamp(currentZoom - deltaY * 0.001, 0.5, 3)
-      this.cameras.main.setZoom(newZoom)
-    })
-  }
-
-  private setupPointerEvents(): void {
-    this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
-      const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y)
-      const tileX = Math.floor(worldPoint.x / this.tileSize)
-      const tileY = Math.floor(worldPoint.y / this.tileSize)
-
-      this.hoverTile = { x: tileX, y: tileY }
-    })
-
-    this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
-      if (pointer.leftButtonDown()) {
-        const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y)
-        const tileX = Math.floor(worldPoint.x / this.tileSize)
-        const tileY = Math.floor(worldPoint.y / this.tileSize)
-
-        this.handleTileClick(tileX, tileY)
-      }
-    })
+    const camera = this.cameras.main
+    camera.setBounds(0, 0, WORLD.width * TILE_SIZE, WORLD.height * TILE_SIZE)
+    camera.startFollow(this.localPlayer, true, 0.12, 0.12)
+    camera.setZoom(1.4)
+    camera.setBackgroundColor(0x17140f)
   }
 
   private handleTileClick(tileX: number, tileY: number): void {
-    const plotKey = `${tileX},${tileY}`
-    const plot = this.farmPlots.get(plotKey)
+    for (const visual of this.plotVisuals.values()) {
+      if (visual.plot.x === tileX && visual.plot.y === tileY) {
+        const isReady = visual.plot.crop !== null && this.bridge.now() >= visual.plot.crop.harvestAt
+        if (isReady) {
+          this.bridge.onHarvestRequested(visual.plot.tokenId)
+        } else {
+          const next = this.selectedPlotId === visual.plot.tokenId ? null : visual.plot.tokenId
+          this.setSelectedPlot(next)
+          this.bridge.onPlotSelected(next)
+        }
+        return
+      }
+    }
+    // Clicking bare ground clears the selection.
+    this.setSelectedPlot(null)
+    this.bridge.onPlotSelected(null)
+  }
 
-    if (!plot) return
+  // ------------------------------------------------------------ public API
 
-    // Calculate distance from player
-    const playerTile = this.localPlayer.getTilePosition(this.tileSize)
-    const distance = Math.abs(playerTile.x - tileX) + Math.abs(playerTile.y - tileY)
+  /** Replaces the rendered plot set. Called by React whenever chain state changes. */
+  syncPlots(plots: ScenePlot[]): void {
+    const seen = new Set<string>()
 
-    if (distance > 2) {
-      // Too far - move closer first
+    for (const plot of plots) {
+      seen.add(plot.tokenId)
+      const existing = this.plotVisuals.get(plot.tokenId)
+      if (existing) {
+        this.updatePlotVisual(existing, plot)
+      } else {
+        this.plotVisuals.set(plot.tokenId, this.createPlotVisual(plot))
+      }
+    }
+
+    // Remove plots the player no longer owns (sold, or transferred away).
+    for (const [tokenId, visual] of this.plotVisuals) {
+      if (!seen.has(tokenId)) {
+        visual.container.destroy(true)
+        this.plotVisuals.delete(tokenId)
+        if (this.selectedPlotId === tokenId) this.setSelectedPlot(null)
+      }
+    }
+  }
+
+  /** Replaces the rendered remote players. */
+  syncRemotePlayers(players: SceneRemotePlayer[]): void {
+    const seen = new Set<string>()
+
+    for (const remote of players) {
+      seen.add(remote.id)
+      const worldX = remote.x * TILE_SIZE + TILE_SIZE / 2
+      const worldY = remote.y * TILE_SIZE + TILE_SIZE / 2
+
+      let sprite = this.remotePlayers.get(remote.id)
+      if (!sprite) {
+        sprite = new Player(this, worldX, worldY, remote.username, false)
+        this.remotePlayers.set(remote.id, sprite)
+      }
+      sprite.setRemoteTarget(worldX, worldY, remote.facing, remote.moving)
+    }
+
+    for (const [id, sprite] of this.remotePlayers) {
+      if (!seen.has(id)) {
+        sprite.destroy(true)
+        this.remotePlayers.delete(id)
+      }
+    }
+  }
+
+  setSelectedPlot(tokenId: string | null): void {
+    this.selectedPlotId = tokenId
+    if (!tokenId) {
+      this.selectionMarker.setVisible(false)
+      return
+    }
+    const visual = this.plotVisuals.get(tokenId)
+    if (!visual) {
+      this.selectionMarker.setVisible(false)
+      return
+    }
+    this.selectionMarker
+      .setPosition(visual.plot.x * TILE_SIZE + TILE_SIZE / 2, visual.plot.y * TILE_SIZE + TILE_SIZE / 2)
+      .setVisible(true)
+  }
+
+  /** Floating "+120 FGOLD" feedback at a plot. */
+  showRewardBurst(tokenId: string, text: string): void {
+    const visual = this.plotVisuals.get(tokenId)
+    if (!visual) return
+
+    const label = this.add.text(
+      visual.plot.x * TILE_SIZE + TILE_SIZE / 2,
+      visual.plot.y * TILE_SIZE,
+      text,
+      {
+        fontSize: '13px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#e8bd68',
+        stroke: '#100e0b',
+        strokeThickness: 4,
+      }
+    )
+    label.setOrigin(0.5, 1).setDepth(2000)
+
+    this.tweens.add({
+      targets: label,
+      y: label.y - 34,
+      alpha: 0,
+      duration: 1200,
+      ease: 'Cubic.easeOut',
+      onComplete: () => label.destroy(),
+    })
+  }
+
+  /** Brief plant animation on a plot. */
+  showPlantEffect(tokenId: string): void {
+    const visual = this.plotVisuals.get(tokenId)
+    if (!visual) return
+    this.tweens.add({
+      targets: visual.cropText,
+      scale: { from: 0.2, to: 1 },
+      duration: 320,
+      ease: 'Back.easeOut',
+    })
+  }
+
+  // ------------------------------------------------------------- plot draw
+
+  private createPlotVisual(plot: ScenePlot): PlotVisual {
+    const centreX = plot.x * TILE_SIZE + TILE_SIZE / 2
+    const centreY = plot.y * TILE_SIZE + TILE_SIZE / 2
+    const container = this.add.container(centreX, centreY)
+
+    const soil = this.add.rectangle(0, 0, TILE_SIZE - 2, TILE_SIZE - 2, 0x5c4632)
+    soil.setStrokeStyle(1, 0x352c22)
+
+    const readyRing = this.add.circle(0, 0, TILE_SIZE * 0.55)
+    readyRing.setStrokeStyle(2, 0x86c06a, 0.9)
+    readyRing.setVisible(false)
+
+    const cropText = this.add.text(0, -2, '', {
+      fontSize: '18px',
+      fontFamily: 'system-ui, sans-serif',
+    })
+    cropText.setOrigin(0.5, 0.5)
+
+    const progressBg = this.add.rectangle(0, TILE_SIZE / 2 - 5, TILE_SIZE - 8, 3, 0x100e0b, 0.7)
+    const progressBar = this.add.rectangle(-(TILE_SIZE - 8) / 2, TILE_SIZE / 2 - 5, 0, 3, 0x86c06a)
+    progressBar.setOrigin(0, 0.5)
+
+    const levelPips = this.add.graphics()
+
+    container.add([soil, readyRing, cropText, progressBg, progressBar, levelPips])
+    this.plotLayer.add(container)
+
+    const visual: PlotVisual = {
+      container, soil, cropText, progressBg, progressBar, levelPips, readyRing, plot,
+    }
+    this.updatePlotVisual(visual, plot)
+    return visual
+  }
+
+  private updatePlotVisual(visual: PlotVisual, plot: ScenePlot): void {
+    visual.plot = plot
+
+    const centreX = plot.x * TILE_SIZE + TILE_SIZE / 2
+    const centreY = plot.y * TILE_SIZE + TILE_SIZE / 2
+    visual.container.setPosition(centreX, centreY)
+
+    // Richer soil for a more fertile plot, so value is legible on the map.
+    const fertilityTint = Phaser.Display.Color.Interpolate.ColorWithColor(
+      new Phaser.Display.Color(0x6b5540),
+      new Phaser.Display.Color(0x3d2c1c),
+      100,
+      Math.min(100, Math.max(0, plot.fertility - 50))
+    )
+    visual.soil.setFillStyle(
+      Phaser.Display.Color.GetColor(fertilityTint.r, fertilityTint.g, fertilityTint.b)
+    )
+
+    // Upgrade level as pips along the top edge.
+    visual.levelPips.clear()
+    if (plot.level > 0) {
+      visual.levelPips.fillStyle(0xd9a441, 1)
+      const pipCount = Math.min(plot.level, 10)
+      const spacing = 2.6
+      const startX = -((pipCount - 1) * spacing) / 2
+      for (let i = 0; i < pipCount; i++) {
+        visual.levelPips.fillCircle(startX + i * spacing, -TILE_SIZE / 2 + 4, 1)
+      }
+    }
+
+    this.refreshCropState(visual)
+  }
+
+  /** Updates growth stage, progress bar and ready state from the clock. */
+  private refreshCropState(visual: PlotVisual): void {
+    const { plot } = visual
+    const now = this.bridge.now()
+
+    if (!plot.crop) {
+      visual.cropText.setText('')
+      visual.progressBar.width = 0
+      visual.progressBg.setVisible(false)
+      visual.readyRing.setVisible(false)
       return
     }
 
-    const action = this.config.selectedAction
+    const { plantedAt, harvestAt, emoji, cropEmoji } = plot.crop
+    const span = Math.max(1, harvestAt - plantedAt)
+    const progress = Phaser.Math.Clamp((now - plantedAt) / span, 0, 1)
+    const isReady = now >= harvestAt
 
-    if (action === 'plant' && plot.stage === CROP_EMPTY) {
-      // Plant a crop
-      plot.stage = CROP_PLANTED
-      plot.cropType = 1 // Default to wheat
-      plot.plantedAt = Date.now()
-      this.updatePlotGraphics(plot)
+    // Four visible growth stages, so a glance tells you roughly how long is
+    // left without reading the bar.
+    let glyph: string
+    let scale: number
+    if (isReady) {
+      glyph = cropEmoji
+      scale = 1
+    } else if (progress < 0.34) {
+      glyph = '·'
+      scale = 0.9
+    } else if (progress < 0.67) {
+      glyph = emoji
+      scale = 0.75
+    } else {
+      glyph = cropEmoji
+      scale = 0.85
+    }
 
-      // Call the plant callback
-      this.config.onPlant(tileX * this.mapWidth + tileY, 1)
+    if (visual.cropText.text !== glyph) visual.cropText.setText(glyph)
+    visual.cropText.setScale(scale)
+    visual.cropText.setAlpha(isReady ? 1 : 0.85)
 
-      // Simulate growth
-      this.simulateCropGrowth(plot)
+    visual.progressBg.setVisible(!isReady)
+    visual.progressBar.setVisible(!isReady)
+    visual.progressBar.width = (TILE_SIZE - 8) * progress
 
-    } else if (action === 'harvest' && plot.stage === CROP_READY) {
-      // Harvest the crop
-      this.config.onHarvest(tileX * this.mapWidth + tileY)
-
-      // Add harvest animation
-      this.add.particles(
-        tileX * this.tileSize + this.tileSize / 2,
-        tileY * this.tileSize + this.tileSize / 2,
-        undefined,
-        {
-          speed: 100,
-          scale: { start: 0.5, end: 0 },
-          lifespan: 500,
-          quantity: 10,
-          emitting: false,
-        }
-      )
-
-      // Reset plot
-      plot.stage = CROP_EMPTY
-      plot.cropType = 0
-      plot.plantedAt = 0
-      this.updatePlotGraphics(plot)
+    visual.readyRing.setVisible(isReady)
+    if (isReady) {
+      // Gentle pulse to draw the eye across the map.
+      const pulse = 1 + Math.sin(now * 2) * 0.06
+      visual.readyRing.setScale(pulse)
     }
   }
 
-  private simulateCropGrowth(plot: FarmPlot): void {
-    // Stage 1 -> Stage 2
-    this.time.delayedCall(3000, () => {
-      if (plot.stage === CROP_PLANTED) {
-        plot.stage = CROP_GROWING
-        this.updatePlotGraphics(plot)
-      }
-    })
+  // ------------------------------------------------------------------ loop
 
-    // Stage 2 -> Stage 3
-    this.time.delayedCall(6000, () => {
-      if (plot.stage === CROP_GROWING) {
-        plot.stage = CROP_READY
-        this.updatePlotGraphics(plot)
-      }
-    })
+  update(_time: number, delta: number): void {
+    this.updateLocalMovement(delta)
+
+    this.localPlayer.update(delta)
+    for (const sprite of this.remotePlayers.values()) sprite.update(delta)
+
+    for (const visual of this.plotVisuals.values()) this.refreshCropState(visual)
+
+    if (this.selectedPlotId) this.setSelectedPlot(this.selectedPlotId)
   }
 
-  update(time: number, delta: number): void {
-    // Handle input
-    this.handleMovementInput(time)
-
-    // Update local player
-    this.localPlayer.update(time, delta)
-
-    // Update other players
-    this.otherPlayers.forEach((otherPlayer) => {
-      otherPlayer.player.update(time, delta)
-    })
-
-    // Update UI layer based on hover
-    this.updateHoverIndicator()
-  }
-
-  private handleMovementInput(time: number): void {
-    if (time - this.lastMoveTime < this.moveDelay) return
-    if (this.localPlayer.isCurrentlyMoving()) return
+  private updateLocalMovement(delta: number): void {
+    if (!this.cursors || !this.wasd) return
 
     let dx = 0
     let dy = 0
+    if (this.cursors.left.isDown || this.wasd.A.isDown) dx -= 1
+    if (this.cursors.right.isDown || this.wasd.D.isDown) dx += 1
+    if (this.cursors.up.isDown || this.wasd.W.isDown) dy -= 1
+    if (this.cursors.down.isDown || this.wasd.S.isDown) dy += 1
 
-    if (this.cursors.left.isDown || this.wasdKeys.A.isDown) {
-      dx = -1
-    } else if (this.cursors.right.isDown || this.wasdKeys.D.isDown) {
-      dx = 1
-    } else if (this.cursors.up.isDown || this.wasdKeys.W.isDown) {
-      dy = -1
-    } else if (this.cursors.down.isDown || this.wasdKeys.S.isDown) {
-      dy = 1
-    }
+    const moving = dx !== 0 || dy !== 0
 
-    if (dx !== 0 || dy !== 0) {
-      const currentTile = this.localPlayer.getTilePosition(this.tileSize)
-      const newTileX = currentTile.x + dx
-      const newTileY = currentTile.y + dy
+    if (moving) {
+      // Normalise so diagonal movement is not faster than orthogonal.
+      const length = Math.hypot(dx, dy)
+      dx /= length
+      dy /= length
 
-      // Check bounds
-      if (newTileX < 0 || newTileX >= this.mapWidth ||
-          newTileY < 0 || newTileY >= this.mapHeight) {
-        return
+      if (Math.abs(dx) > Math.abs(dy)) this.facing = dx > 0 ? 'right' : 'left'
+      else this.facing = dy > 0 ? 'down' : 'up'
+
+      const step = (MOVE_SPEED * delta) / 1000
+      const nextX = this.localPlayer.x + dx * step
+      const nextY = this.localPlayer.y + dy * step
+
+      // Axis-separated collision, so sliding along an obstacle still works.
+      if (!this.isBlocked(Math.floor(nextX / TILE_SIZE), Math.floor(this.localPlayer.y / TILE_SIZE))) {
+        this.localPlayer.x = Phaser.Math.Clamp(nextX, TILE_SIZE / 2, WORLD.width * TILE_SIZE - TILE_SIZE / 2)
       }
-
-      // Check for blocking tiles
-      const tileType = this.tileMap[newTileY][newTileX]
-      if (tileType === TILE_WATER || tileType === TILE_FENCE) {
-        return
+      if (!this.isBlocked(Math.floor(this.localPlayer.x / TILE_SIZE), Math.floor(nextY / TILE_SIZE))) {
+        this.localPlayer.y = Phaser.Math.Clamp(nextY, TILE_SIZE / 2, WORLD.height * TILE_SIZE - TILE_SIZE / 2)
       }
+    }
 
-      this.localPlayer.moveByTile(dx, dy, this.tileSize)
-      this.lastMoveTime = time
+    this.localPlayer.setLocalPosition(this.localPlayer.x, this.localPlayer.y, this.facing, moving)
+
+    // Throttle network updates, and only send when the tile actually changed
+    // or the player just stopped - a per-frame stream would swamp the server.
+    const now = this.time.now
+    if (now - this.lastNetworkSend < NETWORK_TICK_MS) return
+
+    const tileX = Math.floor(this.localPlayer.x / TILE_SIZE)
+    const tileY = Math.floor(this.localPlayer.y / TILE_SIZE)
+    const changed = tileX !== this.lastSentX || tileY !== this.lastSentY
+
+    if (changed || (!moving && this.lastSentX !== -1)) {
+      this.lastNetworkSend = now
+      this.lastSentX = tileX
+      this.lastSentY = tileY
+      this.bridge.onMove(tileX, tileY, this.facing, moving)
     }
   }
 
-  private updateHoverIndicator(): void {
-    // Remove existing hover indicator
-    this.uiLayer.removeAll(true)
+  // -------------------------------------------------------------- teardown
 
-    if (!this.hoverTile) return
+  private shutdownScene(): void {
+    for (const dispose of this.teardown) dispose()
+    this.teardown = []
 
-    const { x: tileX, y: tileY } = this.hoverTile
+    for (const sprite of this.remotePlayers.values()) sprite.destroy(true)
+    this.remotePlayers.clear()
 
-    // Check if hovering over a farm plot
-    const plotKey = `${tileX},${tileY}`
-    const plot = this.farmPlots.get(plotKey)
+    for (const visual of this.plotVisuals.values()) visual.container.destroy(true)
+    this.plotVisuals.clear()
 
-    if (plot && this.config.selectedAction) {
-      // Show action indicator
-      const indicator = this.add.rectangle(
-        tileX * this.tileSize + this.tileSize / 2,
-        tileY * this.tileSize + this.tileSize / 2,
-        this.tileSize - 2,
-        this.tileSize - 2,
-        this.config.selectedAction === 'plant' ? 0x4ade80 : 0xfbbf24,
-        0.3
-      )
-      indicator.setStrokeStyle(2, this.config.selectedAction === 'plant' ? 0x22c55e : 0xf59e0b)
-      this.uiLayer.add(indicator)
-    }
-  }
-
-  // Public method to update config
-  updateConfig(newConfig: Partial<MainSceneConfig>): void {
-    this.config = { ...this.config, ...newConfig }
-  }
-
-  // Public method to add a new player
-  addPlayer(playerId: string, x: number, y: number): void {
-    if (this.otherPlayers.has(playerId)) return
-
-    const player = new Player({
-      scene: this,
-      x: x * this.tileSize + this.tileSize / 2,
-      y: y * this.tileSize + this.tileSize / 2,
-      texture: 'player',
-      playerId,
-      isLocalPlayer: false,
-    })
-
-    this.otherPlayers.set(playerId, {
-      id: playerId,
-      player,
-      lastUpdate: Date.now(),
-    })
-  }
-
-  // Public method to remove a player
-  removePlayer(playerId: string): void {
-    const otherPlayer = this.otherPlayers.get(playerId)
-    if (otherPlayer) {
-      otherPlayer.player.destroy()
-      this.otherPlayers.delete(playerId)
-    }
-  }
-
-  // Public method to update player position
-  updatePlayerPosition(playerId: string, x: number, y: number): void {
-    const otherPlayer = this.otherPlayers.get(playerId)
-    if (otherPlayer) {
-      otherPlayer.player.moveTo(
-        x * this.tileSize + this.tileSize / 2,
-        y * this.tileSize + this.tileSize / 2
-      )
-      otherPlayer.lastUpdate = Date.now()
-    }
+    this.tweens.killAll()
   }
 }

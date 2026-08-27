@@ -6,7 +6,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "next": "14.2.3",
@@ -14,7 +18,8 @@
     "react-dom": "^18.3.1",
     "phaser": "^3.80.1",
     "ethers": "^6.12.1",
-    "zustand": "^4.5.2"
+    "zustand": "^4.5.2",
+    "socket.io-client": "^4.7.5"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",
@@ -25,6 +30,13 @@
     "postcss": "^8.4.38",
     "autoprefixer": "^10.4.19",
     "eslint": "^8.57.0",
-    "eslint-config-next": "14.2.3"
+    "eslint-config-next": "14.2.3",
+    "vitest": "^2.1.8",
+    "@vitest/coverage-v8": "^2.1.8",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/user-event": "^14.5.2",
+    "jsdom": "^25.0.1",
+    "@vitejs/plugin-react": "^4.3.4"
   }
 }

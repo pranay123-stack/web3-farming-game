@@ -1,248 +1,198 @@
 'use client'
 
-import { useState } from 'react'
-import { useGameContract } from '@/hooks/useGameContract'
-import { SEED_INFO, RECIPE_INFO, SEED_TYPES, RECIPES } from '@/lib/contracts'
+import { useMemo, useState } from 'react'
+import { useGameState } from '@/providers/GameStateProvider'
+import { useGameActions } from '@/hooks/useGameActions'
+import {
+  ItemType, RARITY_COLOR, RARITY_LABEL, itemEmoji, itemName, seedMeta, type Rarity,
+} from '@/lib/gameMeta'
+import { formatToken, formatGrowthTime } from '@/lib/format'
+import type { InventoryItem } from '@/lib/state/gameTypes'
+import { EmptyState, PanelSkeleton } from './FarmPanel'
 
-interface InventoryProps {
-  onCraft?: (recipeId: number) => void
-}
+type Tab = 'seeds' | 'crops' | 'tools'
 
-type TabType = 'items' | 'seeds' | 'crops' | 'crafting'
+/**
+ * Player inventory, read entirely from FarmNFT.
+ *
+ * Every item shown is a token the wallet actually holds. The previous version
+ * rendered a fixed array of invented items - wheat, corn, a "Golden Hoe" -
+ * that existed nowhere on chain.
+ */
+export function Inventory({ selectedPlotId }: { selectedPlotId: bigint | null }) {
+  const { inventory, playerState, lands } = useGameState()
+  const [tab, setTab] = useState<Tab>('seeds')
 
-export default function Inventory({ onCraft }: InventoryProps) {
-  const { ownedNFTs, playerStats, tokenBalance, isLoading } = useGameContract()
-  const [activeTab, setActiveTab] = useState<TabType>('items')
-  const [selectedItem, setSelectedItem] = useState<number | null>(null)
+  const grouped = useMemo(() => ({
+    seeds: inventory.filter((i) => i.itemType === ItemType.SEED),
+    crops: inventory.filter((i) => i.itemType === ItemType.CROP),
+    tools: inventory.filter(
+      (i) => i.itemType === ItemType.TOOL || i.itemType === ItemType.CONSUMABLE
+    ),
+  }), [inventory])
 
-  // Mock inventory data for demo
-  const seeds = [
-    { id: SEED_TYPES.WHEAT, amount: 10, ...SEED_INFO[SEED_TYPES.WHEAT] },
-    { id: SEED_TYPES.CORN, amount: 5, ...SEED_INFO[SEED_TYPES.CORN] },
-    { id: SEED_TYPES.TOMATO, amount: 3, ...SEED_INFO[SEED_TYPES.TOMATO] },
-    { id: SEED_TYPES.CARROT, amount: 8, ...SEED_INFO[SEED_TYPES.CARROT] },
-    { id: SEED_TYPES.PUMPKIN, amount: 2, ...SEED_INFO[SEED_TYPES.PUMPKIN] },
-  ]
-
-  const items = [
-    { id: 1, name: 'Watering Can', emoji: '🪣', amount: 1, rarity: 'common' },
-    { id: 2, name: 'Fertilizer', emoji: '🧪', amount: 5, rarity: 'common' },
-    { id: 3, name: 'Golden Hoe', emoji: '⛏️', amount: 1, rarity: 'rare' },
-    { id: 4, name: 'Magic Seeds', emoji: '✨', amount: 2, rarity: 'epic' },
-  ]
-
-  const crops = [
-    { id: 1, name: 'Wheat', emoji: '🌾', amount: 25, quality: 'A' },
-    { id: 2, name: 'Corn', emoji: '🌽', amount: 12, quality: 'S' },
-    { id: 3, name: 'Tomato', emoji: '🍅', amount: 8, quality: 'B' },
-  ]
-
-  const recipes = [
-    { id: RECIPES.BASIC_FERTILIZER, ...RECIPE_INFO[RECIPES.BASIC_FERTILIZER], cost: '5 Wheat' },
-    { id: RECIPES.WATER_CAN, ...RECIPE_INFO[RECIPES.WATER_CAN], cost: '10 Wood' },
-    { id: RECIPES.SCARECROW, ...RECIPE_INFO[RECIPES.SCARECROW], cost: '15 Straw' },
-    { id: RECIPES.SEED_BAG, ...RECIPE_INFO[RECIPES.SEED_BAG], cost: '5 Leather' },
-  ]
-
-  const getRarityColor = (rarity: string) => {
-    switch (rarity) {
-      case 'common': return 'border-gray-500'
-      case 'uncommon': return 'border-green-500'
-      case 'rare': return 'border-blue-500'
-      case 'epic': return 'border-purple-500'
-      case 'legendary': return 'border-yellow-500'
-      default: return 'border-gray-500'
-    }
+  if (playerState === 'loading' && inventory.length === 0) {
+    return <PanelSkeleton rows={2} />
   }
 
-  const tabs: { id: TabType; label: string; icon: string }[] = [
-    { id: 'items', label: 'Items', icon: '🎒' },
-    { id: 'seeds', label: 'Seeds', icon: '🌱' },
-    { id: 'crops', label: 'Crops', icon: '🌾' },
-    { id: 'crafting', label: 'Craft', icon: '🔨' },
+  const tabs: { id: Tab; label: string; count: number }[] = [
+    { id: 'seeds', label: 'Seeds', count: grouped.seeds.length },
+    { id: 'crops', label: 'Crops', count: grouped.crops.length },
+    { id: 'tools', label: 'Tools', count: grouped.tools.length },
   ]
 
+  const items = grouped[tab]
+  const plot = selectedPlotId ? lands.find((l) => l.tokenId === selectedPlotId) : null
+  const canPlant = Boolean(plot && !plot.isLocked)
+
   return (
-    <div className="h-full flex flex-col bg-game-dark/50">
-      {/* Header */}
-      <div className="p-3 border-b border-game-border">
-        <div className="flex items-center justify-between mb-2">
-          <h3 className="font-pixel text-game-primary text-xs">Inventory</h3>
-          {playerStats && (
-            <div className="text-xs text-slate-400">
-              Lv.{playerStats.level}
-            </div>
-          )}
-        </div>
-
-        {/* Tabs */}
-        <div className="flex gap-1">
-          {tabs.map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={`
-                flex-1 py-1 px-2 text-xs rounded transition-all
-                ${activeTab === tab.id
-                  ? 'bg-game-primary text-game-darker'
-                  : 'bg-game-darker text-slate-400 hover:text-white'
-                }
-              `}
-            >
-              <span className="mr-1">{tab.icon}</span>
-              <span className="hidden sm:inline">{tab.label}</span>
-            </button>
-          ))}
-        </div>
+    <div className="flex h-full flex-col">
+      <div className="flex items-center justify-between px-3 py-2">
+        <h2 className="heading">Inventory</h2>
+        <span className="text-xs text-text-muted tabular">{inventory.length} items</span>
       </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-3">
-        {activeTab === 'items' && (
-          <div className="grid grid-cols-4 gap-2">
-            {items.map((item) => (
-              <button
-                key={item.id}
-                onClick={() => setSelectedItem(selectedItem === item.id ? null : item.id)}
-                className={`
-                  inventory-slot relative
-                  ${getRarityColor(item.rarity)}
-                  ${selectedItem === item.id ? 'selected' : ''}
-                `}
-                title={item.name}
-              >
-                <span className="text-xl">{item.emoji}</span>
-                {item.amount > 1 && (
-                  <span className="absolute bottom-0 right-0 text-[10px] font-bold text-white bg-game-darker px-1 rounded">
-                    {item.amount}
-                  </span>
-                )}
-              </button>
-            ))}
-            {/* Empty slots */}
-            {Array.from({ length: Math.max(0, 12 - items.length) }).map((_, i) => (
-              <div key={`empty-${i}`} className="inventory-slot opacity-50" />
-            ))}
-          </div>
-        )}
-
-        {activeTab === 'seeds' && (
-          <div className="grid grid-cols-4 gap-2">
-            {seeds.map((seed) => (
-              <button
-                key={seed.id}
-                onClick={() => setSelectedItem(selectedItem === seed.id ? null : seed.id)}
-                className={`
-                  inventory-slot relative
-                  ${getRarityColor(seed.rarity)}
-                  ${selectedItem === seed.id ? 'selected' : ''}
-                `}
-                title={`${seed.name} (${seed.growthTime}s)`}
-              >
-                <span className="text-xl">{seed.emoji}</span>
-                {seed.amount > 0 && (
-                  <span className="absolute bottom-0 right-0 text-[10px] font-bold text-white bg-game-darker px-1 rounded">
-                    {seed.amount}
-                  </span>
-                )}
-              </button>
-            ))}
-            {/* Empty slots */}
-            {Array.from({ length: Math.max(0, 12 - seeds.length) }).map((_, i) => (
-              <div key={`empty-${i}`} className="inventory-slot opacity-50" />
-            ))}
-          </div>
-        )}
-
-        {activeTab === 'crops' && (
-          <div className="grid grid-cols-4 gap-2">
-            {crops.map((crop) => (
-              <button
-                key={crop.id}
-                onClick={() => setSelectedItem(selectedItem === crop.id ? null : crop.id)}
-                className={`
-                  inventory-slot relative
-                  ${selectedItem === crop.id ? 'selected' : ''}
-                `}
-                title={`${crop.name} (Quality: ${crop.quality})`}
-              >
-                <span className="text-xl">{crop.emoji}</span>
-                <span className="absolute top-0 right-0 text-[8px] font-bold text-game-accent">
-                  {crop.quality}
-                </span>
-                {crop.amount > 1 && (
-                  <span className="absolute bottom-0 right-0 text-[10px] font-bold text-white bg-game-darker px-1 rounded">
-                    {crop.amount}
-                  </span>
-                )}
-              </button>
-            ))}
-            {/* Empty slots */}
-            {Array.from({ length: Math.max(0, 12 - crops.length) }).map((_, i) => (
-              <div key={`empty-${i}`} className="inventory-slot opacity-50" />
-            ))}
-          </div>
-        )}
-
-        {activeTab === 'crafting' && (
-          <div className="space-y-2">
-            {recipes.map((recipe) => (
-              <div
-                key={recipe.id}
-                className="panel p-2 flex items-center gap-2 hover:border-game-primary transition cursor-pointer"
-                onClick={() => onCraft?.(recipe.id)}
-              >
-                <span className="text-2xl">{recipe.emoji}</span>
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-bold text-white truncate">{recipe.name}</p>
-                  <p className="text-[10px] text-slate-400 truncate">{recipe.description}</p>
-                  <p className="text-[10px] text-game-accent">{recipe.cost}</p>
-                </div>
-                <button
-                  className="btn-secondary text-[10px] px-2 py-1"
-                  disabled={isLoading}
-                >
-                  Craft
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+      <div className="flex gap-1 px-3 pb-2">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={`flex-1 rounded-md px-2 py-1.5 text-xs font-medium transition ${
+              tab === t.id
+                ? 'bg-leaf-500 text-soil-950'
+                : 'bg-soil-800 text-text-secondary hover:text-text-primary'
+            }`}
+          >
+            {t.label}
+            {t.count > 0 && <span className="ml-1 opacity-70 tabular">{t.count}</span>}
+          </button>
+        ))}
       </div>
 
-      {/* Footer - Selected Item Info */}
-      {selectedItem !== null && activeTab !== 'crafting' && (
-        <div className="p-3 border-t border-game-border bg-game-darker">
-          <div className="flex items-center gap-2">
-            <span className="text-2xl">
-              {activeTab === 'items' && items.find(i => i.id === selectedItem)?.emoji}
-              {activeTab === 'seeds' && seeds.find(s => s.id === selectedItem)?.emoji}
-              {activeTab === 'crops' && crops.find(c => c.id === selectedItem)?.emoji}
-            </span>
-            <div className="flex-1">
-              <p className="text-xs font-bold text-white">
-                {activeTab === 'items' && items.find(i => i.id === selectedItem)?.name}
-                {activeTab === 'seeds' && seeds.find(s => s.id === selectedItem)?.name}
-                {activeTab === 'crops' && crops.find(c => c.id === selectedItem)?.name}
-              </p>
-              {activeTab === 'seeds' && (
-                <p className="text-[10px] text-slate-400">
-                  Growth: {seeds.find(s => s.id === selectedItem)?.growthTime}s
-                </p>
-              )}
-            </div>
-            <button className="btn-secondary text-[10px] px-2 py-1">
-              Use
-            </button>
-          </div>
-        </div>
+      {tab === 'seeds' && selectedPlotId && canPlant && (
+        <p className="mx-3 mb-2 rounded-md bg-leaf-500/10 px-2 py-1.5 text-xs text-leaf-300">
+          Choose a seed to plant on plot #{selectedPlotId.toString()}.
+        </p>
       )}
 
-      {/* Stats Footer */}
-      <div className="p-2 border-t border-game-border bg-game-darker/50 flex justify-between text-[10px] text-slate-400">
-        <span>Balance: {tokenBalance} FARM</span>
-        <span>Harvests: {playerStats?.totalHarvests || 0}</span>
+      <div className="scrollbar-thin flex-1 overflow-y-auto px-3 pb-3">
+        {items.length === 0 ? (
+          <EmptyState
+            icon={tab === 'seeds' ? '🌱' : tab === 'crops' ? '🌾' : '🔨'}
+            title={`No ${tab} yet`}
+            body={
+              tab === 'seeds' ? 'Buy seeds from the shop to start farming.'
+              : tab === 'crops' ? 'Harvest a crop and it will appear here as an NFT.'
+              : 'Craft a tool to see it here.'
+            }
+          />
+        ) : (
+          <div className="grid grid-cols-4 gap-2">
+            {items.map((item) => (
+              <ItemSlot
+                key={item.tokenId.toString()}
+                item={item}
+                plantablePlotId={tab === 'seeds' && canPlant ? selectedPlotId : null}
+              />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   )
 }
+
+function ItemSlot({
+  item, plantablePlotId,
+}: {
+  item: InventoryItem
+  plantablePlotId: bigint | null
+}) {
+  const { plantCrop } = useGameActions()
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  const rarityColor = RARITY_COLOR[item.rarity as Rarity] ?? RARITY_COLOR[0]
+  const name = itemName(item.itemType, item.seedTypeId)
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="slot-interactive w-full text-xl"
+        style={{ borderColor: rarityColor }}
+        title={name}
+        aria-label={name}
+        aria-expanded={open}
+      >
+        <span aria-hidden>{itemEmoji(item.itemType, item.seedTypeId)}</span>
+        <span className="absolute bottom-0.5 right-1 text-[9px] text-text-muted tabular">
+          #{item.tokenId.toString()}
+        </span>
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} aria-hidden />
+          <div className="panel absolute left-1/2 z-50 mt-1 w-52 -translate-x-1/2 p-2.5 shadow-xl">
+            <p className="text-sm font-medium">{name}</p>
+            <p className="text-xs" style={{ color: rarityColor }}>
+              {RARITY_LABEL[item.rarity as Rarity] ?? 'Common'}
+            </p>
+
+            <dl className="mt-2 space-y-0.5 text-xs">
+              <Row label="Token" value={`#${item.tokenId.toString()}`} />
+              {item.itemType === ItemType.SEED && (
+                <>
+                  <Row label="Grows in" value={formatGrowthTime(item.growthTime)} />
+                  <Row label="Base yield" value={`${formatToken(item.yieldAmount)} FGOLD`} />
+                </>
+              )}
+              {item.itemType === ItemType.CROP && (
+                <Row label="Harvest value" value={`${formatToken(item.yieldAmount)} FGOLD`} />
+              )}
+              {item.itemType === ItemType.TOOL && (
+                <>
+                  <Row label="Power" value={String(item.power)} />
+                  <Row label="Durability" value={String(item.durability)} />
+                </>
+              )}
+            </dl>
+
+            {plantablePlotId !== null && item.itemType === ItemType.SEED && (
+              <button
+                className="btn-primary mt-2 w-full text-xs"
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true)
+                  const result = await plantCrop(plantablePlotId, item.tokenId)
+                  setBusy(false)
+                  if (result.ok) setOpen(false)
+                }}
+              >
+                {busy ? 'Planting…' : `Plant on #${plantablePlotId.toString()}`}
+              </button>
+            )}
+
+            {item.itemType === ItemType.SEED && plantablePlotId === null && (
+              <p className="mt-2 text-[11px] leading-snug text-text-muted">
+                Select an empty plot to plant this seed.
+              </p>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between gap-2">
+      <dt className="text-text-muted">{label}</dt>
+      <dd className="text-text-secondary tabular">{value}</dd>
+    </div>
+  )
+}
+
+export default Inventory

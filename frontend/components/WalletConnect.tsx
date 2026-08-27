@@ -1,182 +1,190 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useWallet } from '@/hooks/useWallet'
+import { shortAddress, formatEth } from '@/lib/format'
+import { explorerAddressUrl } from '@/lib/chains'
 
-interface WalletConnectProps {
-  compact?: boolean
-}
-
-export default function WalletConnect({ compact = false }: WalletConnectProps) {
+/**
+ * Wallet connection control.
+ *
+ * Handles every state the wallet can actually be in, each with the one action
+ * that resolves it: no wallet installed, disconnected, connecting, wrong
+ * network, connected.
+ */
+export function WalletConnect({ compact = false }: { compact?: boolean }) {
   const {
-    address,
-    isConnected,
-    isConnecting,
-    balance,
-    error,
-    connect,
-    disconnect,
-    isMetaMaskInstalled,
+    status, address, chainId, chainName, nativeBalance, error,
+    isConnected, isWrongNetwork, hasWallet, isDetecting, targetChain,
+    connect, disconnect, switchNetwork,
   } = useWallet()
-  const [showDropdown, setShowDropdown] = useState(false)
-  const [mounted, setMounted] = useState(false)
 
-  // Prevent hydration mismatch
-  useEffect(() => {
-    setMounted(true)
-  }, [])
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [switching, setSwitching] = useState(false)
 
-  const formatAddress = (addr: string) => {
-    return `${addr.slice(0, 6)}...${addr.slice(-4)}`
+  // --- still looking for a provider ----------------------------------------
+  // Rendered on the server and on the first client paint. Committing to
+  // "install a wallet" here would flash that prompt at people who have one.
+  if (isDetecting || hasWallet === null) {
+    return (
+      <button className="btn-secondary" disabled aria-busy="true">
+        <Spinner />
+        <span className="sr-only">Checking for a wallet</span>
+        Wallet
+      </button>
+    )
   }
 
-  const formatBalance = (bal: string) => {
-    const num = parseFloat(bal)
-    if (num === 0) return '0 ETH'
-    if (num < 0.0001) return '<0.0001 ETH'
-    return `${num.toFixed(4)} ETH`
+  // --- no wallet installed -------------------------------------------------
+  if (status === 'unavailable' || (!hasWallet && status !== 'connecting')) {
+    return (
+      <a
+        href="https://metamask.io/download/"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="btn-secondary"
+      >
+        <span aria-hidden>🦊</span>
+        Install a wallet
+      </a>
+    )
   }
 
+  // --- connecting ----------------------------------------------------------
+  if (status === 'connecting') {
+    return (
+      <button className="btn-secondary" disabled>
+        <Spinner />
+        Connecting…
+      </button>
+    )
+  }
+
+  // --- disconnected --------------------------------------------------------
   if (!isConnected) {
     return (
-      <div className="relative">
-        <button
-          onClick={connect}
-          disabled={isConnecting}
-          className={`
-            ${compact ? 'btn-secondary' : 'btn-game'}
-            flex items-center gap-2
-            ${isConnecting ? 'opacity-50 cursor-wait' : ''}
-          `}
-        >
-          {isConnecting ? (
-            <>
-              <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-              <span className={compact ? 'text-xs' : ''}>Connecting...</span>
-            </>
-          ) : (
-            <>
-              <span className="text-lg">🦊</span>
-              <span className={compact ? 'text-xs' : ''}>
-                {!mounted ? 'Connect Wallet' : isMetaMaskInstalled() ? 'Connect Wallet' : 'Install MetaMask'}
-              </span>
-            </>
-          )}
+      <div className="flex flex-col items-end gap-1">
+        <button onClick={() => void connect()} className="btn-primary">
+          <span aria-hidden>🦊</span>
+          Connect wallet
         </button>
-
-        {error && (
-          <div className="absolute top-full mt-2 right-0 w-64 p-3 bg-red-900/90 border border-red-500 rounded-lg text-xs text-red-200">
-            {error}
-          </div>
-        )}
+        {error && <p className="max-w-[220px] text-right text-xs text-rose-500">{error}</p>}
       </div>
     )
   }
 
+  // --- wrong network -------------------------------------------------------
+  if (isWrongNetwork) {
+    return (
+      <button
+        onClick={async () => {
+          setSwitching(true)
+          await switchNetwork()
+          setSwitching(false)
+        }}
+        disabled={switching}
+        className="btn-gold"
+        title={`Connected to ${chainName}, but the game runs on ${targetChain.name}`}
+      >
+        {switching ? <Spinner /> : <span aria-hidden>⚠️</span>}
+        Switch to {targetChain.shortName}
+      </button>
+    )
+  }
+
+  // --- connected -----------------------------------------------------------
+  const explorer = address ? explorerAddressUrl(address, chainId ?? undefined) : null
+
   return (
     <div className="relative">
       <button
-        onClick={() => setShowDropdown(!showDropdown)}
-        className={`
-          ${compact ? 'px-2 py-1' : 'px-4 py-2'}
-          bg-game-dark border border-game-border rounded-lg
-          hover:border-game-primary transition-all
-          flex items-center gap-2
-        `}
+        onClick={() => setMenuOpen((open) => !open)}
+        className="btn-secondary"
+        aria-expanded={menuOpen}
+        aria-haspopup="menu"
       >
-        {/* Status indicator */}
-        <div className="w-2 h-2 bg-game-primary rounded-full animate-pulse" />
-
-        {/* Address */}
-        <span className={`font-mono ${compact ? 'text-xs' : 'text-sm'} text-game-primary`}>
-          {formatAddress(address!)}
-        </span>
-
-        {/* Balance (hidden on compact) */}
+        <span className="h-2 w-2 rounded-full bg-leaf-400" aria-hidden />
+        <span className="tabular">{shortAddress(address)}</span>
         {!compact && (
-          <span className="text-xs text-slate-400 border-l border-game-border pl-2">
-            {formatBalance(balance)}
+          <span className="text-text-muted tabular">
+            {formatEth(nativeBalance, 3)} ETH
           </span>
         )}
-
-        {/* Dropdown arrow */}
-        <svg
-          className={`w-4 h-4 text-slate-400 transition-transform ${showDropdown ? 'rotate-180' : ''}`}
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-        </svg>
       </button>
 
-      {/* Dropdown Menu */}
-      {showDropdown && (
+      {menuOpen && (
         <>
-          {/* Backdrop */}
           <div
             className="fixed inset-0 z-40"
-            onClick={() => setShowDropdown(false)}
+            onClick={() => setMenuOpen(false)}
+            aria-hidden
           />
-
-          {/* Menu */}
-          <div className="absolute top-full mt-2 right-0 w-64 bg-game-dark border border-game-border rounded-lg shadow-xl z-50 overflow-hidden">
-            {/* Header */}
-            <div className="p-4 border-b border-game-border">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 bg-game-primary/20 rounded-full flex items-center justify-center">
-                  <span className="text-xl">👨‍🌾</span>
-                </div>
-                <div>
-                  <p className="font-mono text-sm text-white">
-                    {formatAddress(address!)}
-                  </p>
-                  <p className="text-xs text-slate-400">
-                    {formatBalance(balance)}
-                  </p>
-                </div>
-              </div>
+          <div
+            role="menu"
+            className="panel absolute right-0 z-50 mt-2 w-60 overflow-hidden p-1 shadow-xl"
+          >
+            <div className="border-b px-3 py-2" style={{ borderColor: 'var(--soil-700)' }}>
+              <p className="heading">Connected</p>
+              <p className="mt-1 break-all font-mono text-xs text-text-secondary">{address}</p>
+              <p className="mt-2 text-xs text-text-muted">
+                {chainName} · {formatEth(nativeBalance, 4)} ETH
+              </p>
             </div>
 
-            {/* Actions */}
-            <div className="p-2">
-              <button
-                onClick={() => {
-                  navigator.clipboard.writeText(address!)
-                  setShowDropdown(false)
-                }}
-                className="w-full px-3 py-2 text-left text-sm text-slate-300 hover:bg-game-border rounded-lg transition flex items-center gap-2"
-              >
-                <span>📋</span>
-                Copy Address
-              </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                if (address) void navigator.clipboard?.writeText(address)
+                setMenuOpen(false)
+              }}
+              className="w-full rounded-md px-3 py-2 text-left text-sm text-text-secondary hover:bg-soil-800 hover:text-text-primary"
+            >
+              Copy address
+            </button>
 
+            {explorer && (
               <a
-                href={`https://etherscan.io/address/${address}`}
+                role="menuitem"
+                href={explorer}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="w-full px-3 py-2 text-left text-sm text-slate-300 hover:bg-game-border rounded-lg transition flex items-center gap-2 block"
+                className="block rounded-md px-3 py-2 text-sm text-text-secondary hover:bg-soil-800 hover:text-text-primary"
+                onClick={() => setMenuOpen(false)}
               >
-                <span>🔗</span>
-                View on Explorer
+                View on explorer ↗
               </a>
+            )}
 
-              <div className="border-t border-game-border my-2" />
+            <button
+              role="menuitem"
+              onClick={() => {
+                disconnect()
+                setMenuOpen(false)
+              }}
+              className="w-full rounded-md px-3 py-2 text-left text-sm text-rose-500 hover:bg-soil-800"
+            >
+              Disconnect
+            </button>
 
-              <button
-                onClick={() => {
-                  disconnect()
-                  setShowDropdown(false)
-                }}
-                className="w-full px-3 py-2 text-left text-sm text-red-400 hover:bg-red-900/30 rounded-lg transition flex items-center gap-2"
-              >
-                <span>🚪</span>
-                Disconnect
-              </button>
-            </div>
+            {/* Being honest about what "disconnect" can actually do. */}
+            <p className="px-3 pb-2 pt-1 text-[11px] leading-snug text-text-muted">
+              Forgets your wallet in this tab. Revoke site access from your
+              wallet to disconnect fully.
+            </p>
           </div>
         </>
       )}
     </div>
   )
 }
+
+function Spinner() {
+  return (
+    <span
+      className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent"
+      aria-hidden
+    />
+  )
+}
+
+export default WalletConnect

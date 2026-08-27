@@ -1,105 +1,173 @@
-@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/**
+ * Visual language: a warm, slightly earthy dark palette. It reads as a game
+ * rather than a dashboard - rounded panels, a soft glow on interactive
+ * elements, and a single amber accent reserved for currency and rewards.
+ */
+
 :root {
-  --foreground-rgb: 255, 255, 255;
-  --background-start-rgb: 15, 23, 42;
-  --background-end-rgb: 2, 6, 23;
+  --soil-950: #100e0b;
+  --soil-900: #17140f;
+  --soil-850: #1e1a14;
+  --soil-800: #262019;
+  --soil-700: #352c22;
+  --soil-600: #4a3d2f;
+
+  --leaf-500: #6aa84f;
+  --leaf-400: #86c06a;
+  --leaf-300: #a8d68f;
+
+  --gold-500: #d9a441;
+  --gold-400: #e8bd68;
+
+  --sky-500: #4a9ede;
+  --rose-500: #d9534f;
+
+  --text-primary: #f2ede4;
+  --text-secondary: #b8ae9d;
+  --text-muted: #7d7365;
+}
+
+* {
+  border-color: var(--soil-700);
+}
+
+html,
+body {
+  height: 100%;
 }
 
 body {
-  color: rgb(var(--foreground-rgb));
-  background: linear-gradient(
-      to bottom,
-      transparent,
-      rgb(var(--background-end-rgb))
-    )
-    rgb(var(--background-start-rgb));
-  min-height: 100vh;
+  background-color: var(--soil-950);
+  color: var(--text-primary);
+  font-feature-settings: 'tnum' 1;
+  overscroll-behavior: none;
 }
 
-/* Custom scrollbar */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+/* Numeric readouts must not reflow as digits change. */
+.tabular {
+  font-variant-numeric: tabular-nums;
 }
 
-::-webkit-scrollbar-track {
-  background: #1e293b;
-  border-radius: 4px;
+@layer components {
+  .panel {
+    @apply rounded-xl border bg-soil-850/80 backdrop-blur-sm;
+    border-color: var(--soil-700);
+  }
+
+  .panel-flush {
+    @apply rounded-xl border bg-soil-850;
+    border-color: var(--soil-700);
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2
+           text-sm font-medium transition-all duration-150
+           disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .btn-primary {
+    @apply btn bg-leaf-500 text-soil-950 hover:bg-leaf-400
+           active:scale-[0.98] shadow-[0_2px_0_0_#4d7a37];
+  }
+
+  .btn-gold {
+    @apply btn bg-gold-500 text-soil-950 hover:bg-gold-400
+           active:scale-[0.98] shadow-[0_2px_0_0_#a87d2e];
+  }
+
+  .btn-secondary {
+    @apply btn border bg-soil-800 text-text-primary hover:bg-soil-700
+           active:scale-[0.98];
+    border-color: var(--soil-600);
+  }
+
+  .btn-ghost {
+    @apply btn text-text-secondary hover:bg-soil-800 hover:text-text-primary;
+  }
+
+  .btn-danger {
+    @apply btn bg-rose-500/90 text-white hover:bg-rose-500 active:scale-[0.98];
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1
+           text-xs font-medium;
+    border-color: var(--soil-600);
+  }
+
+  .input {
+    @apply w-full rounded-lg border bg-soil-900 px-3 py-2 text-sm
+           text-text-primary placeholder:text-text-muted
+           focus:border-leaf-500 focus:outline-none focus:ring-1 focus:ring-leaf-500/40;
+    border-color: var(--soil-600);
+  }
+
+  .slot {
+    @apply relative flex aspect-square items-center justify-center rounded-lg
+           border-2 bg-soil-900 transition-all;
+    border-color: var(--soil-700);
+  }
+
+  .slot-interactive {
+    @apply slot cursor-pointer hover:border-leaf-500 hover:bg-soil-800;
+  }
+
+  .slot-selected {
+    @apply border-leaf-400 bg-leaf-500/10 ring-2 ring-leaf-500/30;
+  }
+
+  .heading {
+    @apply text-xs font-semibold uppercase tracking-[0.14em] text-text-muted;
+  }
 }
 
-::-webkit-scrollbar-thumb {
-  background: #475569;
-  border-radius: 4px;
+/* Progress bar fill for crop growth. */
+.growth-bar {
+  background-image: linear-gradient(90deg, var(--leaf-500), var(--leaf-300));
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #64748b;
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--soil-600) transparent;
+}
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: var(--soil-600);
+  border-radius: 3px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
 }
 
-/* Pixel art rendering */
-.pixel-art {
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
+@keyframes float-up {
+  0% { transform: translateY(0); opacity: 1; }
+  100% { transform: translateY(-28px); opacity: 0; }
+}
+.animate-float-up {
+  animation: float-up 1.1s ease-out forwards;
 }
 
-/* Game container */
-.game-container {
-  box-shadow: 0 0 40px rgba(74, 222, 128, 0.3);
+@keyframes pulse-ring {
+  0% { transform: scale(0.9); opacity: 0.7; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+.animate-pulse-ring {
+  animation: pulse-ring 1.6s ease-out infinite;
 }
 
-/* Button styles */
-.btn-game {
-  @apply px-6 py-3 bg-game-primary text-game-darker font-pixel text-sm rounded-lg
-         hover:bg-game-secondary transition-all duration-200
-         shadow-lg hover:shadow-game-primary/50
-         active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed;
-}
-
-.btn-secondary {
-  @apply px-4 py-2 bg-game-border text-white font-pixel text-xs rounded-lg
-         hover:bg-slate-600 transition-all duration-200
-         active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed;
-}
-
-/* Panel styles */
-.panel {
-  @apply bg-game-dark/90 backdrop-blur-sm border border-game-border rounded-lg p-4;
-}
-
-/* Glow effect */
-.glow {
-  box-shadow: 0 0 20px rgba(74, 222, 128, 0.4);
-}
-
-/* Inventory slot */
-.inventory-slot {
-  @apply w-12 h-12 bg-game-darker border border-game-border rounded
-         flex items-center justify-center cursor-pointer
-         hover:border-game-primary hover:bg-game-dark transition-all;
-}
-
-.inventory-slot.selected {
-  @apply border-game-accent bg-game-dark;
-}
-
-/* Chat styles */
-.chat-message {
-  @apply py-1 px-2 text-sm;
-}
-
-.chat-message.system {
-  @apply text-game-accent italic;
-}
-
-.chat-message.player {
-  @apply text-white;
-}
-
-.chat-message .username {
-  @apply text-game-primary font-bold mr-2;
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
